@@ -100,7 +100,7 @@ GUILD_ID = int(config.get("guild_id") or 0) or None
 MAIN_COLOR = 0x6A0DAD
 WIN_COLOR = 0x57F287
 LOSS_COLOR = 0xED4245
-BREAKER = "<:breaker:1506954137441538068>"
+BREAKER = "<:breaker:1537913026643238932>"
 BREAKER_LINE = BREAKER * 10
 
 ALLOWED_CHANNEL_ID = int(config.get("allowed_channel_id") or 0) or None
@@ -169,12 +169,34 @@ def is_owner(user: discord.abc.User, guild: discord.Guild = None) -> bool:
 
 
 def load_np_users():
+    """Load users who can use commands without the prefix."""
+    path = os.path.join("data", "np_users.json")
+    os.makedirs("data", exist_ok=True)
+
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            json.dump({"users": []}, f, indent=2)
+        return set()
+
     try:
-        with open("data/np_users.json") as f:
+        with open(path, "r") as f:
             data = json.load(f)
-        return set(int(uid) for uid in data.get("users", []))
+        return {int(uid) for uid in data.get("users", [])}
     except Exception:
         return set()
+
+
+def save_np_users(users_set):
+    """Save the set of no-prefix user IDs to file."""
+    path = os.path.join("data", "np_users.json")
+    os.makedirs("data", exist_ok=True)
+
+    try:
+        with open(path, "w") as f:
+            json.dump({"users": sorted(list(users_set))}, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def error_embed(ctx, title, desc):
@@ -193,20 +215,34 @@ def error_embed(ctx, title, desc):
 
 
 def build_command_candidates(bot: commands.Bot):
-    candidates = []
+    """Build a list of possible full command names (including aliases) for prefix commands."""
+    candidates = set()
+
     for cmd in bot.walk_commands():
         if cmd.hidden:
             continue
-        candidates.append(cmd.qualified_name.lower())
-        if cmd.parent:
-            parent_name = cmd.full_parent_name.lower()
-            for alias in cmd.aliases:
-                candidates.append(f"{parent_name} {alias}".strip().lower())
-        else:
-            for alias in cmd.aliases:
-                candidates.append(alias.lower())
-    candidates.sort(key=len, reverse=True)
-    return candidates
+
+        # Build full name chain with real names/aliases at each level
+        parts = []
+        parent = cmd
+        while parent is not None:
+            parts.append((parent.name.lower(), [a.lower() for a in parent.aliases]))
+            parent = parent.parent
+        parts.reverse()
+
+        # Generate all possible command name combinations
+        combos = [""]
+        for name, aliases in parts:
+            names = [name] + aliases
+            combos = [
+                f"{prefix} {n}".strip() if prefix else n
+                for prefix in combos
+                for n in names
+            ]
+
+        candidates.update(combos)
+
+    return sorted(candidates, key=len, reverse=True)
 
 
 class Nuvella(commands.Bot):
@@ -342,21 +378,32 @@ class Nuvella(commands.Bot):
             await self.process_commands(message)
             return
 
+        original = message.content
         np_users = load_np_users()
+
+        # No-prefix handling: if user is in np_users and message starts with a command name,
+        # add the prefix so it gets processed normally.
         if message.author.id in np_users:
-            content_lower = message.content.lower().strip()
-            for name in build_command_candidates(self):
+            content_lower = original.lower().strip()
+            candidates = build_command_candidates(self)
+
+            for name in candidates:
                 if content_lower == name or content_lower.startswith(name + " "):
-                    message.content = PREFIX + message.content
+                    # Only add prefix if not already present
+                    if not original.lower().startswith(PREFIX.lower()):
+                        message.content = PREFIX + original
                     break
 
+        # If message still doesn't start with prefix, ignore it
         if not PREFIX or not message.content.lower().startswith(PREFIX.lower()):
             return
 
+        # Staff bypass all restrictions
         if is_staff(message.author):
             await self.process_commands(message)
             return
 
+        # Enforce allowed channel for non‑staff
         if ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
             try:
                 await message.delete()
@@ -424,6 +471,110 @@ async def amiblacklisted(ctx):
         await ctx.send("🔴 You **ARE** blacklisted. (But if you're staff, you're exempt.)")
     else:
         await ctx.send("🟢 You are **NOT** blacklisted.")
+
+
+@bot.group(name="np", invoke_without_command=True)
+async def np_group(ctx):
+    """Manage no-prefix users."""
+    if not is_staff(ctx.author):
+        embed = error_embed(ctx, "Denied", "Only staff members can manage no-prefix users.")
+        await ctx.send(embed=embed)
+        return
+
+    users = load_np_users()
+    if users:
+        user_list = "\n".join([f"• <@{uid}> (`{uid}`)" for uid in sorted(users)])
+    else:
+        user_list = "No users have no-prefix access."
+
+    embed = discord.Embed(
+        title="No-Prefix Users",
+        description=f"{user_list}\n{BREAKER_LINE}",
+        color=MAIN_COLOR,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@np_group.command(name="add")
+async def np_add(ctx, user: discord.User = None):
+    """Add a user to the no-prefix list."""
+    if not is_staff(ctx.author):
+        embed = error_embed(ctx, "Denied", "Only staff members can manage no-prefix users.")
+        await ctx.send(embed=embed)
+        return
+
+    if user is None:
+        embed = error_embed(ctx, "Error", "Please specify a user to add. Usage: `$np add @user`")
+        await ctx.send(embed=embed)
+        return
+
+    users = load_np_users()
+    if user.id in users:
+        embed = discord.Embed(
+            title="Already Added",
+            description=f"{user.mention} already has no-prefix access.\n{BREAKER_LINE}",
+            color=WIN_COLOR,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+        return
+
+    users.add(user.id)
+    if save_np_users(users):
+        embed = discord.Embed(
+            title="No-Prefix Access Granted",
+            description=f"{user.mention} can now use commands without the prefix.\n{BREAKER_LINE}",
+            color=WIN_COLOR,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+    else:
+        embed = error_embed(ctx, "Error", "Failed to save no-prefix users.")
+        await ctx.send(embed=embed)
+
+
+@np_group.command(name="remove")
+async def np_remove(ctx, user: discord.User = None):
+    """Remove a user from the no-prefix list."""
+    if not is_staff(ctx.author):
+        embed = error_embed(ctx, "Denied", "Only staff members can manage no-prefix users.")
+        await ctx.send(embed=embed)
+        return
+
+    if user is None:
+        embed = error_embed(ctx, "Error", "Please specify a user to remove. Usage: `$np remove @user`")
+        await ctx.send(embed=embed)
+        return
+
+    users = load_np_users()
+    if user.id not in users:
+        embed = discord.Embed(
+            title="Not Found",
+            description=f"{user.mention} does not have no-prefix access.\n{BREAKER_LINE}",
+            color=LOSS_COLOR,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+        return
+
+    users.remove(user.id)
+    if save_np_users(users):
+        embed = discord.Embed(
+            title="No-Prefix Access Revoked",
+            description=f"{user.mention} can no longer use commands without the prefix.\n{BREAKER_LINE}",
+            color=WIN_COLOR,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+    else:
+        embed = error_embed(ctx, "Error", "Failed to save no-prefix users.")
+        await ctx.send(embed=embed)
 
 
 @bot.tree.command(name="shutdown", description="Shut down the bot.")

@@ -701,16 +701,6 @@ class Moderation(commands.Cog):
         await self._snipereaction_logic(ctx, index, channel)
 
     # ══════════════════════════════════════════════════
-    #  SHUTDOWN
-    # ══════════════════════════════════════════════════
-    @commands.command(name="shutdown")
-    @require("bot_owner")
-    async def shutdown(self, ctx):
-        await self.send(ctx, make_embed(ctx, f"{EMOJI_STOP} Shutting Down", "Bot is shutting down...", LOSS_COLOR))
-        await self.bot.close()
-        sys.exit(0)
-
-    # ══════════════════════════════════════════════════
     #  SET LOG CHANNEL
     # ══════════════════════════════════════════════════
     @commands.command(name="setlogchannel")
@@ -1919,47 +1909,6 @@ class Moderation(commands.Cog):
             lines = [m.mention for m in sorted(members, key=lambda m: m.name.lower())]
             embed.add_field(name=label, value="\n".join(lines), inline=True)
         await self.send(ctx, embed)
-
-    # ══════════════════════════════════════════════════
-    #  NO‑PREFIX MANAGEMENT
-    # ══════════════════════════════════════════════════
-    @commands.group(name="np", invoke_without_command=True)
-    @require("admin")
-    async def np_group(self, ctx):
-        await self.send(ctx, make_embed(ctx, "No‑Prefix Help",
-            "`np add <user>` — Add to no‑prefix\n"
-            "`np remove <user>` — Remove from no‑prefix\n"
-            "`np list` — List all no‑prefix users", MAIN_COLOR))
-
-    @np_group.command(name="add")
-    @require("admin")
-    async def np_add(self, ctx, user: discord.Member):
-        exists = await self.db.fetchval("SELECT 1 FROM np_users WHERE user_id = $1", user.id)
-        if exists:
-            return await self.send(ctx, error_embed(ctx, f"{user.mention} is already in the no‑prefix list."))
-        await self.db.execute("INSERT INTO np_users (user_id) VALUES ($1)", user.id)
-        await self.send(ctx, success_embed(ctx, f"{user.mention} can now use commands without prefix."))
-
-    @np_group.command(name="remove")
-    @require("admin")
-    async def np_remove(self, ctx, user: discord.Member):
-        result = await self.db.execute("DELETE FROM np_users WHERE user_id = $1", user.id)
-        if result == "DELETE 0":
-            return await self.send(ctx, error_embed(ctx, f"{user.mention} is not in the no‑prefix list."))
-        await self.send(ctx, success_embed(ctx, f"{user.mention} removed from no‑prefix list."))
-
-    @np_group.command(name="list")
-    @require("admin")
-    async def np_list(self, ctx):
-        rows = await self.db.fetch("SELECT user_id FROM np_users")
-        if not rows:
-            return await self.send(ctx, make_embed(ctx, "No‑Prefix List", "No users.", MAIN_COLOR))
-        lines = []
-        for r in rows:
-            uid = r["user_id"]
-            m = ctx.guild.get_member(uid)
-            lines.append(f"• {m.mention} ({m.name})" if m else f"• <@{uid}> *(not in server)*")
-        await self.send(ctx, make_embed(ctx, "No‑Prefix Users", "\n".join(lines), MAIN_COLOR))
 
     # ══════════════════════════════════════════════════
     #  MASS MODERATION

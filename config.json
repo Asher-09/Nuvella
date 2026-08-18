@@ -2,6 +2,7 @@
   "owner_id": 1327528116079296594,
   "prefix": "$",
   "allowed_channel_id": 1535962338048475267,
+  "log_channel_id": 1537456851921281115,
   "roles": {
     "admin_role_id": 1535961372951576596,
     "senior_moderator_role_id": 1535961383336812685,
@@ -22,13 +23,35 @@
     "level_20_role_id": 1535961586399977512,
     "level_10_role_id": 1535961565319266394,
     "level_1_role_id": 1535961544725368872,
-    "supporter_role_id":1536182809830625292,
-    "contributor_role_id":1535961511275536477,
+    "supporter_role_id": 1536182809830625292,
+    "contributor_role_id": 1535961511275536477,
     "booster_role_id": 1535961511275536477,
     "luck_boost_role_id": 1535961362147057745,
     "top_role_id": 1537456149861900380
   },
   "economy": {
+    "collect_roles": {
+      "admin": { "role_id": 1535961372951576596, "amount": 16000 },
+      "senior_moderator": { "role_id": 1535961383336812685, "amount": 15000 },
+      "moderator": { "role_id": 1535961394120364122, "amount": 14000 },
+      "trial_moderator": { "role_id": 1535961404509524039, "amount": 12000 },
+      "developer": { "role_id": 1535966374134939669, "amount": 13000 },
+      "event_manager": { "role_id": 1535961479550083234, "amount": 14000 },
+      "event_trial": { "role_id": 1535996114753560606, "amount": 12000 },
+      "level_100": { "role_id": 1535961760023052329, "amount": 12000 },
+      "level_90": { "role_id": 1535961738904870962, "amount": 10000 },
+      "level_80": { "role_id": 1535961717274714132, "amount": 8000 },
+      "level_70": { "role_id": 1535961695988748298, "amount": 6000 },
+      "level_60": { "role_id": 1535961673016287306, "amount": 4000 },
+      "level_50": { "role_id": 1535961651734519909, "amount": 2000 },
+      "level_40": { "role_id": 1535961629093531718, "amount": 1000 },
+      "level_30": { "role_id": 1535961607845322813, "amount": 800 },
+      "level_20": { "role_id": 1535961586399977512, "amount": 600 },
+      "level_10": { "role_id": 1535961565319266394, "amount": 400 },
+      "level_1": { "role_id": 1535961544725368872, "amount": 200 },
+      "supporter": { "role_id": 1536182809830625292, "amount": 5000 },
+      "contributor": { "role_id": 1535961511275536477, "amount": 10000 }
+    },
     "collect_amounts": {
       "admin": 16000,
       "senior_moderator": 15000,
@@ -48,15 +71,17 @@
       "level_20": 600,
       "level_10": 400,
       "level_1": 200,
-      "supporter":5000,
-      "contributor":10000
+      "supporter": 5000,
+      "contributor": 10000
     }
+  },
+  "logging": {
+    "command_logging": false
   },
   "allowed_link_role_ids": [
     111111111111111111,
     222222222222222222
   ],
-  "log_channel_id": 123456789012345678,
   "clown_role_id": 1537464769450348656,
   "antinuke": {
     "enabled": true,

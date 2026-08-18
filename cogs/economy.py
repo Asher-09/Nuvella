@@ -161,25 +161,14 @@ async def log_to_discord(bot, message: str):
     except Exception as e:
         print(f"Failed to log to Discord: {e}")
 
-ITEM_PRICES = {
-    "rod": 500, "watchdog": 10000, "luck_potion": 1500,
-    "horseshoe": 3000, "custom_role": 10_000_000,
+# Default shop items (static)
+DEFAULT_SHOP_ITEMS = {
+    "rod": {"price": 500, "type": "passive", "description": "Passive: +5% win chance when fishing."},
+    "watchdog": {"price": 10000, "type": "consumable", "description": "Consumable: protects you from one robbery."},
+    "luck_potion": {"price": 1500, "type": "consumable", "description": "Consumable: greatly boosts your luck in the next game."},
+    "horseshoe": {"price": 3000, "type": "passive", "description": "Passive: permanent +5% win chance in all games."},
+    "custom_role": {"price": 10_000_000, "type": "consumable", "description": "One‑time purchase: grants you the `Custom Role` role for 2 months."},
 }
-ITEM_TYPE = {
-    "rod": "passive", "watchdog": "consumable", "luck_potion": "consumable",
-    "horseshoe": "passive", "custom_role": "consumable",
-}
-ITEM_DESCRIPTIONS = {
-    "rod": "Passive: +5% win chance when fishing.",
-    "watchdog": "Consumable: protects you from one robbery.",
-    "luck_potion": "Consumable: greatly boosts your luck in the next game.",
-    "horseshoe": "Passive: permanent +5% win chance in all games.",
-    "custom_role": "One‑time purchase: grants you the `Custom Role` role for 2 months.",
-}
-SHOP_ITEMS = list(ITEM_PRICES.keys())
-
-def get_item_by_index(index: int):
-    return SHOP_ITEMS[index - 1] if 1 <= index <= len(SHOP_ITEMS) else None
 
 def parse_amount_str(s: str) -> int:
     s = s.lower().replace(",", "").strip()
@@ -254,6 +243,7 @@ def user_lock(uid: int) -> asyncio.Lock:
     return _user_locks[uid]
 
 # ─── VIEWS ──────────────────────────────────────────────────────
+# (All existing view classes remain unchanged; only LeaderboardView was updated to have dynamic dropdown)
 class CoinFlipView(discord.ui.View):
     def __init__(self, ctx, bet, has_luck, cog):
         super().__init__(timeout=30)
@@ -925,11 +915,13 @@ class Economy(commands.Cog):
         self.current_top_user_id = None
         self.collect_roles = {}
         self.staff_role_ids = set()
+        self.custom_shop_items = {}  # name -> dict with price, type, payload, description
 
     async def cog_load(self):
-        self.pool = await asyncpg.create_pool(DB_URL, min_size=5, max_size=20)
+        self.pool = await asyncpg.create_pool(DB_URL, min_size=10, max_size=50)  # tuned for 500 active
         await self._init_db()
         self._load_collect_config()
+        await self._load_custom_shop()
 
         self.hourly_status.start()
         self.top_role_update.start()
@@ -1007,6 +999,13 @@ class Economy(commands.Cog):
             rid = ROLES_CONFIG.get(key)
             if rid:
                 self.staff_role_ids.add(int(rid))
+
+        # Hardcoded contributor and supporter collect roles
+        # (can be overridden by config above if present)
+        if 1535961511275536477 not in self.collect_roles:
+            self.collect_roles[1535961511275536477] = 10000
+        if 1536182809830625292 not in self.collect_roles:
+            self.collect_roles[1536182809830625292] = 5000
 
     def get_collect_amount(self, member: discord.Member) -> int:
         best = 0
@@ -1111,11 +1110,127 @@ class Economy(commands.Cog):
                         last_collected BIGINT NOT NULL
                     )
                 """)
+                # Custom shop tables
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS custom_shop_items (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT UNIQUE NOT NULL,
+                        price BIGINT NOT NULL,
+                        item_type TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        description TEXT,
+                        active BOOLEAN DEFAULT TRUE
+                    )
+                """)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_custom_items (
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        shop_item_id INTEGER NOT NULL REFERENCES custom_shop_items(id) ON DELETE CASCADE,
+                        purchased_at BIGINT NOT NULL,
+                        PRIMARY KEY (user_id, shop_item_id)
+                    )
+                """)
+                # Indexes
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_user_time ON balance_snapshots (user_id, taken_at)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_wallet ON users (wallet DESC)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_bank ON users (bank DESC)")
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_net ON users ((wallet + bank) DESC)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_custom_shop_active ON custom_shop_items (active)")
                 await conn.execute("ANALYZE")
+
+    # ─── Custom Shop Methods ─────────────────────────────────────
+    async def _load_custom_shop(self):
+        """Load active custom shop items into self.custom_shop_items."""
+        rows = await self._fetch("SELECT id, name, price, item_type, payload, description FROM custom_shop_items WHERE active = TRUE")
+        self.custom_shop_items = {}
+        for r in rows:
+            self.custom_shop_items[r['name']] = {
+                'id': r['id'],
+                'price': r['price'],
+                'type': r['item_type'],
+                'payload': r['payload'],
+                'description': r['description'] or "",
+            }
+
+    async def _add_custom_shop_item(self, name, price, item_type, payload, description=""):
+        """Insert a new custom shop item and refresh cache."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO custom_shop_items (name, price, item_type, payload, description) VALUES ($1,$2,$3,$4,$5)",
+                    name, price, item_type, payload, description
+                )
+        await self._load_custom_shop()
+
+    async def _remove_custom_shop_item(self, name):
+        """Mark item inactive and refresh cache."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE custom_shop_items SET active = FALSE WHERE name = $1", name)
+        await self._load_custom_shop()
+
+    async def _get_custom_shop_item_by_name(self, name):
+        """Fetch a custom shop item by name (case-insensitive)."""
+        row = await self._fetchrow("SELECT id, price, item_type, payload, description FROM custom_shop_items WHERE name ILIKE $1 AND active = TRUE", name)
+        return row
+
+    async def _grant_custom_item(self, user_id, item_name):
+        """Apply the effect of a custom shop item (role, perk, title) and record purchase."""
+        item = self.custom_shop_items.get(item_name)
+        if not item:
+            # try case-insensitive
+            for key in self.custom_shop_items:
+                if key.lower() == item_name.lower():
+                    item = self.custom_shop_items[key]
+                    item_name = key
+                    break
+            if not item:
+                return None
+        # Apply effect based on type
+        guild = self.bot.get_guild(self.log_channel.guild.id) if hasattr(self, 'log_channel') else None
+        if not guild:
+            # Fallback: get first guild where bot has member
+            guilds = self.bot.guilds
+            guild = guilds[0] if guilds else None
+        if not guild:
+            return False
+
+        member = guild.get_member(user_id)
+        if not member:
+            return False
+
+        payload = item['payload']
+        item_type = item['type'].lower()
+
+        if item_type == "role":
+            role_id = int(payload)
+            role = guild.get_role(role_id)
+            if role:
+                try:
+                    await member.add_roles(role, reason=f"Purchased from shop: {item_name}")
+                except discord.Forbidden:
+                    return False
+            else:
+                return False
+        elif item_type == "perk":
+            # Store perk in user_perks table (if we create one). For simplicity, we just log it.
+            # We'll add a simple table for perks later if needed.
+            # For now, we can store in user_custom_items only.
+            pass
+        elif item_type == "title":
+            # Store title in user_custom_items as payload (text)
+            pass
+        else:
+            return False
+
+        # Record purchase in user_custom_items
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO user_custom_items (user_id, shop_item_id, purchased_at) SELECT $1, id, $2 FROM custom_shop_items WHERE name = $3 AND active = TRUE",
+                    user_id, int(time.time()), item_name
+                )
+        return True
 
     # ─── Economy DB helpers ──────────────────────────────────────
     async def get_wallet(self, uid):
@@ -1205,12 +1320,18 @@ class Economy(commands.Cog):
         await ctx.send(embed=embed)
         return False
 
-    async def log_command_use(self, ctx):
-        wallet = await self.get_wallet(ctx.author.id)
+    async def log_command_use(self, ctx, start_wallet=None):
+        if not LOGGING_CONFIG.get("command_logging", False):
+            return
+        now_wallet = await self.get_wallet(ctx.author.id)
+        if start_wallet is None:
+            start_wallet = now_wallet
         await log_to_discord(
             self.bot,
             f"**{ctx.author}** ({ctx.author.id}) used `{ctx.command.qualified_name}` "
-            f"in #{ctx.channel} — balance before command: `{wallet:,}` Moon Dust"
+            f"in #{ctx.channel}\n"
+            f"Starting Wallet: `{start_wallet:,}` Moon Dust\n"
+            f"Ending Wallet: `{now_wallet:,}` Moon Dust"
         )
 
     # ─── BROKE-USER PURGE ────────────────────────────────────────
@@ -1242,6 +1363,7 @@ class Economy(commands.Cog):
                 await conn.execute("DELETE FROM custom_roles WHERE user_id = $1", user_id)
                 await conn.execute("DELETE FROM left_users WHERE user_id = $1", user_id)
                 await conn.execute("DELETE FROM balance_snapshots WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM user_custom_items WHERE user_id = $1", user_id)
         try:
             user = await self.bot.fetch_user(user_id)
             label = f"{user} ({user_id})"
@@ -1280,6 +1402,7 @@ class Economy(commands.Cog):
                 await conn.execute("DELETE FROM custom_roles WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
                 await conn.execute("DELETE FROM left_users WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
                 await conn.execute("DELETE FROM balance_snapshots WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
+                await conn.execute("DELETE FROM user_custom_items WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
                 await conn.execute("DELETE FROM users WHERE wallet = 0 AND bank = 0")
         await log_to_discord(self.bot, f"Periodic sweep purged {count} broke account(s).")
 
@@ -1370,19 +1493,19 @@ class Economy(commands.Cog):
         top_user_id = row['id']
         if top_user_id == self.current_top_user_id:
             return
-        for member in guild.members:
-            if role in member.roles and member.id != top_user_id:
+        # Remove role from previous top user (use role.members for efficiency)
+        for member in role.members:
+            if member.id != top_user_id:
                 try:
                     await member.remove_roles(role, reason="No longer the top economy player")
                 except discord.Forbidden:
                     pass
         member = guild.get_member(top_user_id)
-        if member:
-            if role not in member.roles:
-                try:
-                    await member.add_roles(role, reason="Top economy player")
-                except discord.Forbidden:
-                    pass
+        if member and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Top economy player")
+            except discord.Forbidden:
+                pass
         self.current_top_user_id = top_user_id
 
     @top_role_update.before_loop
@@ -1411,8 +1534,30 @@ class Economy(commands.Cog):
     @commands.Cog.listener()
     async def on_command_completion(self, ctx):
         if ctx.cog is self and self.pool is not None:
-            await self.log_command_use(ctx)
+            start_wallet = getattr(ctx, '_starting_wallet', None)
+            await self.log_command_use(ctx, start_wallet)
             await self.check_broke(ctx.author.id)
+
+            # Optional user reply with starting/ending balances
+            if LOGGING_CONFIG.get("reply_on_command", False):
+                now_wallet = await self.get_wallet(ctx.author.id)
+                embed = discord.Embed(
+                    title="Command Executed",
+                    description=f"`{ctx.command.qualified_name}` completed.",
+                    color=MAIN_COLOR
+                )
+                embed.add_field(name="Starting Wallet", value=f"`{start_wallet if start_wallet is not None else 'N/A'}` Moon Dust", inline=True)
+                embed.add_field(name="Ending Wallet", value=f"`{now_wallet}` Moon Dust", inline=True)
+                embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+                try:
+                    await ctx.send(embed=embed)
+                except discord.HTTPException:
+                    pass  # Ignore if sending fails (e.g., channel not allowed)
+
+    async def cog_before_invoke(self, ctx):
+        # Store starting wallet for logging
+        if ctx.cog is self and self.pool is not None:
+            ctx._starting_wallet = await self.get_wallet(ctx.author.id)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -1460,10 +1605,11 @@ class Economy(commands.Cog):
             return True
         if ALLOWED_CHANNEL_ID and ctx.channel.id == ALLOWED_CHANNEL_ID:
             return True
-        try:
-            await ctx.message.delete()
-        except discord.HTTPException:
-            pass
+        if ctx.message:
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
         return False
 
     # ─── HELPER FOR LEADERBOARDS ────────────────────────────────
@@ -1807,16 +1953,27 @@ class Economy(commands.Cog):
             "luck_potion": LUCK_CLOVER, "horseshoe": HORSESHOE,
             "custom_role": CROWN
         }
-        for idx, name in enumerate(SHOP_ITEMS, 1):
-            price = ITEM_PRICES[name]
+        # Default items
+        for name, item in DEFAULT_SHOP_ITEMS.items():
+            price = item['price']
             emoji = emoji_map.get(name, PACKAGE)
-            desc = ITEM_DESCRIPTIONS.get(name, "")
+            desc = item['description']
             embed.add_field(
-                name=f"`{idx}` {emoji} {name.replace('_', ' ').title()} — `{format_coins(price)}` Moon Dust",
+                name=f"`{name.replace('_', ' ').title()}` {emoji} — `{format_coins(price)}` Moon Dust",
                 value=desc, inline=False
             )
+        # Custom items
+        for name, item in self.custom_shop_items.items():
+            price = item['price']
+            emoji = PACKAGE  # default
+            item_type = item['type'].capitalize()
+            desc = item['description'] or f"Custom {item_type}"
+            embed.add_field(
+                name=f"`{name}` — `{format_coins(price)}` Moon Dust",
+                value=f"{desc}", inline=False
+            )
         embed.add_field(name="\u200b", value=BREAKER_LINE, inline=False)
-        embed.set_footer(text="Use /buy <item_name or index> [quantity] to purchase")
+        embed.set_footer(text="Use /buy <item_name> [quantity] to purchase")
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="buy")
@@ -1826,44 +1983,69 @@ class Economy(commands.Cog):
             return
         if quantity < 1 or quantity > 10:
             return await ctx.send(embed=result_embed(ctx, "Invalid Quantity", "Quantity must be between 1 and 10.", win=False))
+
+        # Check default items
         item_name = None
-        if item.isdigit():
-            item_name = get_item_by_index(int(item))
+        if item.lower() in DEFAULT_SHOP_ITEMS:
+            item_name = item.lower()
         else:
-            item_lower = item.lower()
-            if item_lower in ITEM_PRICES:
-                item_name = item_lower
-        if item_name is None:
-            return await ctx.send(embed=result_embed(ctx, "Unknown Item", f"Item `{item}` not found. Check `/shop` for available items.", win=False))
-        price = ITEM_PRICES[item_name] * quantity
+            # Check custom items (case-insensitive)
+            for key in self.custom_shop_items:
+                if key.lower() == item.lower():
+                    item_name = key
+                    break
+            if not item_name:
+                return await ctx.send(embed=result_embed(ctx, "Unknown Item", f"Item `{item}` not found. Check `/shop` for available items.", win=False))
+
+        # Handle default items
+        if item_name in DEFAULT_SHOP_ITEMS:
+            price = DEFAULT_SHOP_ITEMS[item_name]['price'] * quantity
+            async with user_lock(ctx.author.id):
+                wallet = await self.get_wallet(ctx.author.id)
+                if wallet < price:
+                    return await ctx.send(embed=result_embed(ctx, "Insufficient Funds", f"You need **{format_coins(price)}** Moon Dust in your wallet but only have **{format_coins(wallet)}**.", win=False))
+                if item_name == "custom_role":
+                    existing = await self._fetchrow("SELECT expiry FROM custom_roles WHERE user_id=$1 AND guild_id=$2", ctx.author.id, ctx.guild.id)
+                    if existing and time.time() < existing['expiry']:
+                        days_left = int((existing['expiry'] - time.time()) / 86400)
+                        return await ctx.send(embed=result_embed(ctx, "Already Purchased", f"You already have the Custom Role for another **{days_left}** days.", win=False))
+                    role = discord.utils.get(ctx.guild.roles, name="Custom Role")
+                    if not role:
+                        return await ctx.send(embed=result_embed(ctx, "Role Not Found", "The 'Custom Role' does not exist. Contact an administrator.", win=False))
+                    await self.add_wallet(ctx.author.id, -price)
+                    try:
+                        await ctx.author.add_roles(role)
+                    except discord.Forbidden:
+                        return await ctx.send(embed=result_embed(ctx, "Permission Error", "I cannot assign that role.", win=False))
+                    expiry = int(time.time()) + 60 * 60 * 24 * 60
+                    await self._execute(
+                        "INSERT INTO custom_roles (user_id, guild_id, expiry, role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, guild_id) DO UPDATE SET expiry = EXCLUDED.expiry, role_id = EXCLUDED.role_id",
+                        ctx.author.id, ctx.guild.id, expiry, role.id
+                    )
+                    embed = result_embed(ctx, f"{CROWN} Custom Role Purchased", f"You bought the **Custom Role** for **{format_coins(price)}** Moon Dust.\nIt will expire in 2 months.", win=True)
+                    return await ctx.send(embed=embed)
+                # Other default items (consumable/passive)
+                await self.add_wallet(ctx.author.id, -price)
+                await self.add_item(ctx.author.id, item_name, quantity)
+                await self._execute("INSERT INTO equipped (user_id, item) VALUES ($1,$2) ON CONFLICT (user_id, item) DO NOTHING", ctx.author.id, item_name)
+            embed = result_embed(ctx, f"{SHOPPING_CART} Purchase", f"You bought **{quantity}× {item_name.replace('_', ' ').title()}** for **{format_coins(price)}** Moon Dust.\nIt has been equipped automatically.")
+            await ctx.send(embed=embed)
+            return
+
+        # Handle custom items
         async with user_lock(ctx.author.id):
             wallet = await self.get_wallet(ctx.author.id)
+            price = self.custom_shop_items[item_name]['price'] * quantity
             if wallet < price:
                 return await ctx.send(embed=result_embed(ctx, "Insufficient Funds", f"You need **{format_coins(price)}** Moon Dust in your wallet but only have **{format_coins(wallet)}**.", win=False))
-            if item_name == "custom_role":
-                existing = await self._fetchrow("SELECT expiry FROM custom_roles WHERE user_id=$1 AND guild_id=$2", ctx.author.id, ctx.guild.id)
-                if existing and time.time() < existing['expiry']:
-                    days_left = int((existing['expiry'] - time.time()) / 86400)
-                    return await ctx.send(embed=result_embed(ctx, "Already Purchased", f"You already have the Custom Role for another **{days_left}** days.", win=False))
-                role = discord.utils.get(ctx.guild.roles, name="Custom Role")
-                if not role:
-                    return await ctx.send(embed=result_embed(ctx, "Role Not Found", "The 'Custom Role' does not exist. Contact an administrator.", win=False))
-                await self.add_wallet(ctx.author.id, -price)
-                try:
-                    await ctx.author.add_roles(role)
-                except discord.Forbidden:
-                    return await ctx.send(embed=result_embed(ctx, "Permission Error", "I cannot assign that role.", win=False))
-                expiry = int(time.time()) + 60 * 60 * 24 * 60
-                await self._execute(
-                    "INSERT INTO custom_roles (user_id, guild_id, expiry, role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, guild_id) DO UPDATE SET expiry = EXCLUDED.expiry, role_id = EXCLUDED.role_id",
-                    ctx.author.id, ctx.guild.id, expiry, role.id
-                )
-                embed = result_embed(ctx, f"{CROWN} Custom Role Purchased", f"You bought the **Custom Role** for **{format_coins(price)}** Moon Dust.\nIt will expire in 2 months.", win=True)
-                return await ctx.send(embed=embed)
+            if quantity != 1:
+                return await ctx.send(embed=result_embed(ctx, "Invalid Quantity", "Custom items can only be bought once at a time.", win=False))
             await self.add_wallet(ctx.author.id, -price)
-            await self.add_item(ctx.author.id, item_name, quantity)
-            await self._execute("INSERT INTO equipped (user_id, item) VALUES ($1,$2) ON CONFLICT (user_id, item) DO NOTHING", ctx.author.id, item_name)
-        embed = result_embed(ctx, f"{SHOPPING_CART} Purchase", f"You bought **{quantity}× {item_name.replace('_', ' ').title()}** for **{format_coins(price)}** Moon Dust.\nIt has been equipped automatically.")
+            success = await self._grant_custom_item(ctx.author.id, item_name)
+            if not success:
+                await self.add_wallet(ctx.author.id, price)
+                return await ctx.send(embed=result_embed(ctx, "Purchase Failed", "Could not apply the item. Please contact an administrator.", win=False))
+        embed = result_embed(ctx, f"{SHOPPING_CART} Purchase", f"You bought **{item_name}** for **{format_coins(price)}** Moon Dust.")
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="inv")
@@ -1876,7 +2058,7 @@ class Economy(commands.Cog):
         if rows:
             for r in rows:
                 item, qty = r['item'], r['qty']
-                type_tag = ITEM_TYPE.get(item, "consumable")
+                type_tag = ITEM_TYPE.get(item, "consumable") if item in ITEM_TYPE else "custom"
                 embed.add_field(name=f"{item.replace('_', ' ').title()} ×{qty}", value=f"Type: {type_tag}", inline=False)
         else:
             embed.description += "\n*Empty*"
@@ -1884,7 +2066,7 @@ class Economy(commands.Cog):
         embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
 
-    # ─── LEADERBOARD COMMANDS ───────────────────────────────────
+    # ─── LEADERBOARD (Universal) ────────────────────────────────
     @commands.hybrid_command(name="leaderboard", aliases=["lb", "top"])
     async def leaderboard(self, ctx: commands.Context):
         """View the fancy interactive leaderboard — wallet, bank, net worth, weekly & monthly gains."""
@@ -1893,102 +2075,7 @@ class Economy(commands.Cog):
         msg = await ctx.send(embed=embed, view=view)
         view.message = msg
 
-    @commands.hybrid_command(name="topwallet", aliases=["tw"])
-    async def topwallet(self, ctx: commands.Context):
-        """See the top 10 wealthiest wallets currently."""
-        filtered = await self._get_top_10("wallet", ctx)
-        embed = base_embed(ctx, f"{TOP_WALLET} Top Wallets")
-        medals = [GOLD_MEDAL, SILVER_MEDAL, BRONZE_MEDAL] + ["🔹"]*7
-        lines = []
-        for idx, (uid, bal) in enumerate(filtered):
-            medal = medals[idx] if idx < len(medals) else f"`{idx+1}`"
-            try:
-                user = await self.bot.fetch_user(uid)
-                name = user.display_name
-            except:
-                name = f"Unknown ({uid})"
-            lines.append(f"{medal} **{name}** — `{bal:,}` Moon Dust")
-        embed.add_field(name="Richest Wallets", value="\n".join(lines) if lines else "No players yet.", inline=False)
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="topbank", aliases=["tb"])
-    async def topbank(self, ctx: commands.Context):
-        """View the top 10 largest bank savings."""
-        filtered = await self._get_top_10("bank", ctx)
-        embed = base_embed(ctx, f"{TOP_BANK} Top Banks")
-        medals = [GOLD_MEDAL, SILVER_MEDAL, BRONZE_MEDAL] + ["🔹"]*7
-        lines = []
-        for idx, (uid, bal) in enumerate(filtered):
-            medal = medals[idx] if idx < len(medals) else f"`{idx+1}`"
-            try:
-                user = await self.bot.fetch_user(uid)
-                name = user.display_name
-            except:
-                name = f"Unknown ({uid})"
-            lines.append(f"{medal} **{name}** — `{bal:,}` Moon Dust")
-        embed.add_field(name="Largest Savings", value="\n".join(lines) if lines else "No players yet.", inline=False)
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="topnet", aliases=["tn"])
-    async def topnet(self, ctx: commands.Context):
-        """View the top 10 net worth (wallet + bank) players."""
-        filtered = await self._get_top_10_net(ctx)
-        embed = base_embed(ctx, f"{GLOBAL} Top Net Worth")
-        medals = [GOLD_MEDAL, SILVER_MEDAL, BRONZE_MEDAL] + ["🔹"]*7
-        lines = []
-        for idx, (uid, bal) in enumerate(filtered):
-            medal = medals[idx] if idx < len(medals) else f"`{idx+1}`"
-            try:
-                user = await self.bot.fetch_user(uid)
-                name = user.display_name
-            except:
-                name = f"Unknown ({uid})"
-            lines.append(f"{medal} **{name}** — `{bal:,}` Moon Dust")
-        embed.add_field(name="Richest Overall", value="\n".join(lines) if lines else "No players yet.", inline=False)
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="topweekly", aliases=["weeklytop", "tw7"])
-    async def topweekly(self, ctx: commands.Context):
-        """View the top 10 Moon Dust earners over the last 7 days."""
-        rows = await self._get_top_gains(ctx, days=7)
-        embed = base_embed(ctx, f"{CROWN} Weekly Top Earners")
-        if not rows:
-            embed.add_field(name="Last 7 Days", value="Not enough data yet for this leaderboard.", inline=False)
-        else:
-            medals = [GOLD_MEDAL, SILVER_MEDAL, BRONZE_MEDAL] + ["🔹"]*7
-            lines = []
-            for idx, (uid, gain) in enumerate(rows):
-                medal = medals[idx] if idx < len(medals) else f"`{idx+1}`"
-                try:
-                    user = await self.bot.fetch_user(uid)
-                    name = user.display_name
-                except:
-                    name = f"Unknown ({uid})"
-                lines.append(f"{medal} **{name}** — `+{format_coins(gain)}` Moon Dust")
-            embed.add_field(name="Last 7 Days", value="\n".join(lines), inline=False)
-        await ctx.send(embed=embed)
-
-    @commands.hybrid_command(name="topmonthly", aliases=["monthlytop", "tw30"])
-    async def topmonthly(self, ctx: commands.Context):
-        """View the top 10 Moon Dust earners over the last 30 days."""
-        rows = await self._get_top_gains(ctx, days=30)
-        embed = base_embed(ctx, f"{CALENDAR} Monthly Top Earners")
-        if not rows:
-            embed.add_field(name="Last 30 Days", value="Not enough data yet for this leaderboard.", inline=False)
-        else:
-            medals = [GOLD_MEDAL, SILVER_MEDAL, BRONZE_MEDAL] + ["🔹"]*7
-            lines = []
-            for idx, (uid, gain) in enumerate(rows):
-                medal = medals[idx] if idx < len(medals) else f"`{idx+1}`"
-                try:
-                    user = await self.bot.fetch_user(uid)
-                    name = user.display_name
-                except:
-                    name = f"Unknown ({uid})"
-                lines.append(f"{medal} **{name}** — `+{format_coins(gain)}` Moon Dust")
-            embed.add_field(name="Last 30 Days", value="\n".join(lines), inline=False)
-        await ctx.send(embed=embed)
-
+    # ─── OWNER/ADMIN COMMANDS ───────────────────────────────────
     @commands.hybrid_command(name="icegive")
     async def mgive(self, ctx: commands.Context, user: discord.Member, amount: str):
         """(Owner only) Give Moon Dust to a player."""
@@ -2040,18 +2127,67 @@ class Economy(commands.Cog):
                     await conn.execute("DELETE FROM balance_snapshots")
                     await conn.execute("DELETE FROM economy_channel_bypass")
                     await conn.execute("DELETE FROM collect_cooldowns")
+                    await conn.execute("DELETE FROM user_custom_items")
+                    await conn.execute("DELETE FROM custom_shop_items")
             await msg.edit(embed=discord.Embed(title=f"{TICK} Economy Reset", description="All balances, inventories, and equipment have been cleared.", color=WIN_COLOR), view=None)
         else:
             await msg.edit(embed=discord.Embed(title=f"{WRONG} Cancelled", description="Economy reset cancelled.", color=MAIN_COLOR), view=None)
 
-    # ─── META COMMAND: economy channelbypass ────────────────────
+    # ─── ADMIN SHOP MANAGEMENT ──────────────────────────────────
     @commands.group(name="economy", invoke_without_command=True)
     async def economy_group(self, ctx: commands.Context):
         """Economy admin commands."""
         if not self.is_owner(ctx.author) and not self.is_staff(ctx.author):
             return
         embed = base_embed(ctx, f"{GEAR} Economy Admin")
-        embed.add_field(name="Subcommands", value="`economy channelbypass <user> <channel>` — Allow user to use economy commands in a specific channel.", inline=False)
+        embed.add_field(name="Subcommands", value="`economy shop add <name> <price> <type> <payload> [description]` — Add custom shop item.\n`economy shop remove <name>` — Remove custom shop item.\n`economy channelbypass <user> <channel>` — Allow user to use economy commands in a specific channel.", inline=False)
+        await ctx.send(embed=embed)
+
+    @economy_group.group(name="shop", invoke_without_command=True)
+    async def economy_shop_group(self, ctx: commands.Context):
+        """Manage custom shop items."""
+        if not self.is_owner(ctx.author) and not self.is_staff(ctx.author):
+            return
+        await ctx.send_help(ctx.command)
+
+    @economy_shop_group.command(name="add")
+    async def economy_shop_add(self, ctx: commands.Context, name: str, price: int, item_type: str, payload: str, *, description: str = ""):
+        """Add a custom shop item.
+        Types: role (payload=role_id), perk (payload=perk_name), title (payload=title_text)
+        """
+        if not self.is_owner(ctx.author) and not self.is_staff(ctx.author):
+            return
+        item_type = item_type.lower()
+        if item_type not in ("role", "perk", "title"):
+            return await ctx.send("Invalid item type. Use `role`, `perk`, or `title`.")
+        if price <= 0:
+            return await ctx.send("Price must be positive.")
+        await self._add_custom_shop_item(name, price, item_type, payload, description)
+        embed = result_embed(ctx, f"{TICK} Shop Item Added", f"Added **{name}** to the shop.", win=True)
+        await ctx.send(embed=embed)
+
+    @economy_shop_group.command(name="remove")
+    async def economy_shop_remove(self, ctx: commands.Context, name: str):
+        """Remove a custom shop item."""
+        if not self.is_owner(ctx.author) and not self.is_staff(ctx.author):
+            return
+        await self._remove_custom_shop_item(name)
+        embed = result_embed(ctx, f"{TICK} Shop Item Removed", f"Removed **{name}** from the shop.", win=True)
+        await ctx.send(embed=embed)
+
+    @economy_shop_group.command(name="list")
+    async def economy_shop_list(self, ctx: commands.Context):
+        """List all custom shop items."""
+        if not self.is_owner(ctx.author) and not self.is_staff(ctx.author):
+            return
+        embed = base_embed(ctx, f"{SHOPPING_CART} Custom Shop Items")
+        if not self.custom_shop_items:
+            embed.description = "No custom items."
+        else:
+            lines = []
+            for name, item in self.custom_shop_items.items():
+                lines.append(f"**{name}** — `{format_coins(item['price'])}` Moon Dust | Type: {item['type']}")
+            embed.description = "\n".join(lines)
         await ctx.send(embed=embed)
 
     @economy_group.command(name="channelbypass")
@@ -2444,6 +2580,19 @@ class Economy(commands.Cog):
 
     # ─── ERROR HANDLING ─────────────────────────────────────────
     async def cog_command_error(self, ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            embed = discord.Embed(title=f"{WRONG} Missing Argument", description=str(error), color=LOSS_COLOR)
+            await ctx.send(embed=embed)
+            return
+        if isinstance(error, commands.BadArgument):
+            embed = discord.Embed(title=f"{WRONG} Invalid Argument", description=str(error), color=LOSS_COLOR)
+            await ctx.send(embed=embed)
+            return
+        # For other errors, send generic message
+        embed = discord.Embed(title=f"{WRONG} Error", description="An unexpected error occurred.", color=LOSS_COLOR)
+        await ctx.send(embed=embed)
         print(f"[Economy] Command {ctx.command} raised: {error}")
 
 
