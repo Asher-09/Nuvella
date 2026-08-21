@@ -124,21 +124,21 @@ class Help(commands.Cog):
             embed.description = "No public commands in this category."
             return embed
 
-        # ─── Fixed truncation helper ────────────────────────────
+        # ─── Compact listing helper ─────────────────────────────
         MAX_FIELD_LENGTH = 1024
-        TRUNC_SUFFIX = "\n… (truncated)"
+        TRUNC_SUFFIX = "… (truncated)"
 
         def format_commands(cmds: List[commands.Command]) -> str:
-            lines = []
-            for cmd in cmds:
-                signature = f"`{PREFIX}{cmd.qualified_name} {cmd.signature}`".rstrip()
-                lines.append(f"• **{cmd.qualified_name}** – {signature}")
-            text = "\n".join(lines)
+            if not cmds:
+                return "None"
+            # List only command names (wrapped in backticks), comma-separated
+            names = [f"`{cmd.qualified_name}`" for cmd in cmds]
+            text = ", ".join(names)
             if len(text) <= MAX_FIELD_LENGTH:
-                return text or "None"
-            # Reserve space for suffix
+                return text
+            # Truncate at the last comma before the limit
             allowed = MAX_FIELD_LENGTH - len(TRUNC_SUFFIX)
-            cut = text.rfind('\n', 0, allowed)
+            cut = text.rfind(',', 0, allowed)
             if cut == -1:
                 cut = allowed
             return text[:cut] + TRUNC_SUFFIX
@@ -251,103 +251,6 @@ class Help(commands.Cog):
 
         view = self.HelpPaginator(self, ctx, pages)
         await ctx.send(embed=pages[0], view=view)
-
-    # ─── Extra help command (DM all commands) ────────────────────
-    @commands.command(name="extrahelp", aliases=["commands"])
-    async def extrahelp_command(self, ctx):
-        """Send a DM with all bot commands organized by cog and permission level."""
-        try:
-            # Get all cogs with commands
-            cog_names = sorted([name for name, cog in self.bot.cogs.items() if cog.get_commands()])
-
-            # Build the comprehensive command list
-            all_text = f"**{self.bot.user.name} - Complete Command List**\n\n"
-
-            for cog_name in cog_names:
-                cog = self.bot.get_cog(cog_name)
-                if not cog:
-                    continue
-
-                commands_by_perm = {
-                    "Owner": [],
-                    "Admins": [],
-                    "Moderators": [],
-                    "Members": []
-                }
-
-                for cmd in cog.get_commands():
-                    if cmd.hidden:
-                        continue
-                    perm = get_command_perm(cmd)
-                    cmd_info = f"**{PREFIX}{cmd.name}** "
-                    if cmd.aliases:
-                        cmd_info += f"(aliases: {', '.join(cmd.aliases)}) "
-                    if cmd.help:
-                        cmd_info += f"- {cmd.help}"
-                    else:
-                        cmd_info += "- No description"
-                    commands_by_perm[perm].append(cmd_info)
-
-                # Add cog section if it has commands
-                if any(commands_by_perm.values()):
-                    all_text += f"\n**━━━ {cog_name.upper()} ━━━**\n\n"
-
-                    for perm_level in ["Owner", "Admins", "Moderators", "Members"]:
-                        if commands_by_perm[perm_level]:
-                            all_text += f"*{perm_level}:*\n"
-                            for cmd_info in commands_by_perm[perm_level]:
-                                all_text += f"  • {cmd_info}\n"
-                            all_text += "\n"
-
-            # Split into chunks if too long (Discord DM limit is 2000 chars per message)
-            chunks = []
-            current_chunk = ""
-            for line in all_text.split("\n"):
-                if len(current_chunk) + len(line) + 1 > 1950:
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                    current_chunk = line
-                else:
-                    current_chunk += line + "\n"
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            # Send DMs
-            if chunks:
-                await ctx.send(f"{EMOJI_ENVELOPE} Sending command list to your DMs...")
-                for chunk in chunks:
-                    try:
-                        await ctx.author.send(chunk)
-                    except discord.Forbidden:
-                        await ctx.send(embed=self.make_embed(
-                            ctx,
-                            f"{EMOJI_CROSS} DM Failed",
-                            "I couldn't send you a DM. Make sure DMs are enabled.",
-                            LOSS_COLOR
-                        ))
-                        return
-
-                await ctx.send(embed=self.make_embed(
-                    ctx,
-                    f"{EMOJI_CHECK} Command List Sent",
-                    f"Check your DMs! ({len(chunks)} messages)",
-                    WIN_COLOR
-                ))
-            else:
-                await ctx.send(embed=self.make_embed(
-                    ctx,
-                    f"{EMOJI_INFO} No Commands",
-                    "No commands found to display.",
-                    MAIN_COLOR
-                ))
-
-        except Exception as e:
-            await ctx.send(embed=self.make_embed(
-                ctx,
-                f"{EMOJI_WARNING} Error",
-                f"Failed to generate command list: {str(e)[:100]}",
-                LOSS_COLOR
-            ))
 
 
 async def setup(bot):

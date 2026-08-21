@@ -2,28 +2,46 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import json
-import os
 import time
 import asyncio
 import re
-from typing import Optional, Union
+import logging
 import datetime
+import unicodedata
+from typing import Optional, Union
 from collections import defaultdict, deque
-import sys
-import traceback
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+# Optional dependencies
+try:
+    from deep_translator import GoogleTranslator
+    TRANSLATOR_AVAILABLE = True
+except ImportError:
+    TRANSLATOR_AVAILABLE = False
+
+try:
+    import pytz
+    TIMEZONE_AVAILABLE = True
+except ImportError:
+    TIMEZONE_AVAILABLE = False
+
+try:
+    import tldextract
+    TLDEXTRACT_AVAILABLE = True
+except ImportError:
+    TLDEXTRACT_AVAILABLE = False
 
 # ---------------------------------------------------------------
-#  Constants and utilities (previously from utils.py)
+#  Constants (unchanged)
 # ---------------------------------------------------------------
-
-# Color constants
 MAIN_COLOR = 0x2F3136
 WIN_COLOR = 0x57F287
 LOSS_COLOR = 0xED4245
 WARN_COLOR = 0xFEE75C
 INFO_COLOR = 0x5865F2
 
-# Emoji strings (standard Unicode emojis)
 EMOJI_MUTE = "<a:mute:1537920441627185274>"
 EMOJI_SUCCESS = "<a:tick:1537915747454554222>"
 EMOJI_WRONG = "<:cross:1537915734087303199>"
@@ -83,7 +101,6 @@ EMOJI_NUMBERS = "<:number_1:1538077486532005969>"
 BREAKER = "───────────────"
 BREAKER_LINE = "━━━━━━━━━━━━━━━━━━━━"
 
-# Staff role mapping (singular -> plural used for cache keys)
 STAFF_ROLE_MAP = {
     "founder": "founders",
     "manager": "managers",
@@ -95,7 +112,6 @@ STAFF_ROLE_MAP = {
     "trial_moderator": "trial_moderators",
 }
 
-# Permission levels (higher number = more power)
 PERM_LEVELS = {
     "user": 0,
     "trial_moderator": 1,
@@ -109,20 +125,6 @@ PERM_LEVELS = {
     "bot_owner": 9,
 }
 
-# Optional dependencies
-try:
-    from deep_translator import GoogleTranslator
-    TRANSLATOR_AVAILABLE = True
-except ImportError:
-    TRANSLATOR_AVAILABLE = False
-
-try:
-    import pytz
-    TIMEZONE_AVAILABLE = True
-except ImportError:
-    TIMEZONE_AVAILABLE = False
-
-# Language codes for translate command
 LANGUAGES = {
     "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
     "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian",
@@ -153,30 +155,22 @@ LANGUAGES = {
 }
 
 # ---------------------------------------------------------------
-#  Helper functions
+#  Helper functions (unchanged)
 # ---------------------------------------------------------------
-
 def make_embed(ctx, title: str, description: str, color: int) -> discord.Embed:
-    """Create a basic embed with the given title, description and color."""
     embed = discord.Embed(title=title, description=description, color=color)
     user = ctx.author if isinstance(ctx, commands.Context) else ctx.user
     if user:
         embed.set_footer(text=f"Requested by {user}", icon_url=user.display_avatar.url)
     return embed
 
-
 def error_embed(ctx, message: str) -> discord.Embed:
-    """Create a red error embed."""
     return discord.Embed(title="Error", description=message, color=0xED4245)
 
-
 def success_embed(ctx, message: str) -> discord.Embed:
-    """Create a green success embed."""
     return discord.Embed(title="Success", description=message, color=0x57F287)
 
-
 def parse_time(duration_str: str) -> int:
-    """Parse a time string like '10s', '5m', '2h', '1d' into seconds. Returns 0 if invalid."""
     if not duration_str:
         return 0
     match = re.match(r"(\d+)([smhd])", duration_str.lower().strip())
@@ -194,9 +188,7 @@ def parse_time(duration_str: str) -> int:
         return amount * 86400
     return 0
 
-
 def fmt_duration(seconds: int) -> str:
-    """Format seconds into a human readable string like '2h 5m 30s'."""
     seconds = max(0, int(seconds))
     days, rem = divmod(seconds, 86400)
     hours, rem = divmod(rem, 3600)
@@ -212,14 +204,10 @@ def fmt_duration(seconds: int) -> str:
         parts.append(f"{secs}s")
     return " ".join(parts)
 
-
 # ---------------------------------------------------------------
 #  Database wrapper (asyncpg based)
 # ---------------------------------------------------------------
-
 class Database:
-    """Simple async wrapper around an asyncpg pool."""
-
     def __init__(self, bot):
         self.bot = bot
         self.pool = getattr(bot, "pool", None)
@@ -244,47 +232,35 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.execute(query, *args)
 
-
 # ---------------------------------------------------------------
-#  Permission decorator
+#  Permission decorator (calls centralized check)
 # ---------------------------------------------------------------
-
 def require(level: str):
     if level not in PERM_LEVELS:
         raise ValueError(f"Invalid permission level: {level}")
 
     async def predicate(ctx: Union[commands.Context, discord.Interaction]):
-        user = ctx.user if isinstance(ctx, discord.Interaction) else ctx.author
         cog = ctx.bot.get_cog("Moderation")
-        if cog:
-            user_level = cog.get_level(user.id)
-        else:
-            user_level = "user"
-        if PERM_LEVELS[user_level] >= PERM_LEVELS[level]:
-            return True
-        raise commands.CheckFailure(
-            message=f"Only **{level.replace('_', ' ').title()}**+ can use this command."
-        )
+        if not cog:
+            raise commands.CheckFailure("Moderation cog not loaded.")
+        await cog.check_mod_permission(ctx, level)
+        return True
 
     def decorator(func):
         decorated = commands.check(predicate)(func)
         decorated.perm_level = level
         return decorated
-
     return decorator
-
 
 # ---------------------------------------------------------------
 #  Moderation Cog
 # ---------------------------------------------------------------
-
 class Moderation(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         cfg = bot.config
         self.owner_id = getattr(bot, "owner_id", None)
 
-        # Role IDs from config
         roles_cfg = cfg.get("roles", {})
         self.staff_role_ids = {
             "admin": roles_cfg.get("admin_role_id"),
@@ -296,15 +272,14 @@ class Moderation(commands.Cog):
         self.allowed_link_role_ids = set(cfg.get("allowed_link_role_ids", []))
         self.log_channel_id = cfg.get("log_channel_id")
         self.clown_role_id = cfg.get("clown_role_id")
-        self.warn_kick_threshold = cfg.get("warn_kick_threshold", 5)
+        self.jail_role_id = cfg.get("jail_role_id")
+        self.jail_channel_id = cfg.get("jail_channel_id")
+        # CHANGED: Renamed to warn_ban_threshold, default 7, fallback to old key
+        self.warn_ban_threshold = cfg.get("warn_ban_threshold", cfg.get("warn_kick_threshold", 7))
 
-        # In-memory caches
         self.owners: set[int] = set()
-        self.staff_cache: dict = {
-            "founders": [], "managers": [], "head_admins": [],
-            "admins": [], "bot_managers": [], "event_managers": [],
-            "moderators": [], "trial_moderators": []
-        }
+        # staff_cache: guild_id -> plural_role -> list of user_id strings
+        self.staff_cache: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
         self.locktext_channels: set[int] = set()
         self.clowns: dict[int, dict[int, str]] = {}
         self.forcenicks: dict[int, dict[int, dict]] = {}
@@ -316,17 +291,19 @@ class Moderation(commands.Cog):
         self.antiphish_enabled = True
         self.wordfilter_enabled = True
 
-        # Snipe caches
         self.snipe_data: dict = defaultdict(lambda: deque(maxlen=5))
         self.edit_snipe_data: dict = defaultdict(lambda: deque(maxlen=5))
         self.reaction_snipe_data: dict = defaultdict(lambda: deque(maxlen=5))
 
         self.db = Database(bot)
 
-        bot.loop.create_task(self._load_data_files())
+        # No startup tasks here; setup() will call _load_data_files
 
+    # ---------------------------------------------------------------
+    #  Database initialization (with migration fix)
+    # ---------------------------------------------------------------
     async def _create_tables_if_not_exists(self):
-        """Create all required database tables if they don't already exist."""
+        # List of all CREATE TABLE statements (no indexes here)
         tables = [
             """
             CREATE TABLE IF NOT EXISTS owners (
@@ -335,9 +312,10 @@ class Moderation(commands.Cog):
             """,
             """
             CREATE TABLE IF NOT EXISTS staff (
-                user_id BIGINT,
-                role TEXT,
-                PRIMARY KEY (user_id, role)
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                role TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, role)
             )
             """,
             """
@@ -389,10 +367,11 @@ class Moderation(commands.Cog):
             """
             CREATE TABLE IF NOT EXISTS warnings (
                 id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                moderator_id BIGINT,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                moderator_id BIGINT NOT NULL,
                 reason TEXT,
-                timestamp BIGINT,
+                timestamp BIGINT NOT NULL,
                 countable BOOLEAN DEFAULT TRUE
             )
             """,
@@ -404,8 +383,14 @@ class Moderation(commands.Cog):
             """,
             """
             CREATE TABLE IF NOT EXISTS jail (
-                user_id BIGINT PRIMARY KEY,
-                data JSONB
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                role_ids BIGINT[],
+                channel_id BIGINT,
+                reason TEXT,
+                moderator_id BIGINT,
+                created_at BIGINT,
+                PRIMARY KEY (guild_id, user_id)
             )
             """,
             """
@@ -416,7 +401,8 @@ class Moderation(commands.Cog):
             """
             CREATE TABLE IF NOT EXISTS nick_history (
                 id SERIAL PRIMARY KEY,
-                user_id BIGINT,
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
                 old_nick TEXT,
                 new_nick TEXT,
                 timestamp BIGINT
@@ -435,21 +421,63 @@ class Moderation(commands.Cog):
             )
             """
         ]
+
+        # Create all tables (if not exist)
         for table_sql in tables:
             await self.db.execute(table_sql)
 
-    async def _load_data_files(self):
-        await self.bot.wait_until_ready()
-        await self._create_tables_if_not_exists()
+        # ---- Migration steps for existing tables (add missing columns) ----
+        # staff: add guild_id if missing
+        await self.db.execute("ALTER TABLE staff ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        # clowns: add guild_id if missing
+        await self.db.execute("ALTER TABLE clowns ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        # forcenicks: add guild_id if missing
+        await self.db.execute("ALTER TABLE forcenicks ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        # warnings: add guild_id and other potentially missing columns
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS moderator_id BIGINT")
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS reason TEXT")
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS timestamp BIGINT")
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS countable BOOLEAN DEFAULT TRUE")
+        # FIX: Add id column if missing (for warning deletion by index)
+        await self.db.execute("ALTER TABLE warnings ADD COLUMN IF NOT EXISTS id SERIAL PRIMARY KEY")
+        # jail: add guild_id and other columns if missing
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS role_ids BIGINT[]")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS channel_id BIGINT")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS reason TEXT")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS moderator_id BIGINT")
+        await self.db.execute("ALTER TABLE jail ADD COLUMN IF NOT EXISTS created_at BIGINT")
+        # nick_history: add guild_id and other columns if missing
+        await self.db.execute("ALTER TABLE nick_history ADD COLUMN IF NOT EXISTS guild_id BIGINT")
+        await self.db.execute("ALTER TABLE nick_history ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await self.db.execute("ALTER TABLE nick_history ADD COLUMN IF NOT EXISTS old_nick TEXT")
+        await self.db.execute("ALTER TABLE nick_history ADD COLUMN IF NOT EXISTS new_nick TEXT")
+        await self.db.execute("ALTER TABLE nick_history ADD COLUMN IF NOT EXISTS timestamp BIGINT")
 
+        # ---- Create indexes after columns are guaranteed ----
+        await self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_warnings_guild_user_countable
+            ON warnings (guild_id, user_id, countable)
+            """
+        )
+
+    async def _load_data_files(self):
         rows = await self.db.fetch("SELECT user_id FROM owners")
         self.owners = {r["user_id"] for r in rows}
 
-        rows = await self.db.fetch("SELECT user_id, role FROM staff")
+        rows = await self.db.fetch("SELECT guild_id, user_id, role FROM staff")
         for r in rows:
-            plural = STAFF_ROLE_MAP.get(r["role"])
-            if plural and r["user_id"] not in self.staff_cache.get(plural, []):
-                self.staff_cache[plural].append(r["user_id"])
+            gid = r["guild_id"]
+            role = r["role"]
+            plural = STAFF_ROLE_MAP.get(role)
+            if plural:
+                uid = str(r["user_id"])
+                if uid not in self.staff_cache[gid][plural]:
+                    self.staff_cache[gid][plural].append(uid)
 
         rows = await self.db.fetch("SELECT channel_id FROM locktext")
         self.locktext_channels = {r["channel_id"] for r in rows}
@@ -480,37 +508,100 @@ class Moderation(commands.Cog):
             uid = str(r["user_id"])
             self.modstats.setdefault(uid, {})[r["command"]] = r["count"]
 
-    def get_level(self, user_id: int) -> str:
+    # ---------------------------------------------------------------
+    #  Centralized permission & target checks
+    # ---------------------------------------------------------------
+    def _get_actor(self, ctx) -> Optional[discord.Member]:
+        if isinstance(ctx, discord.Interaction):
+            user = ctx.user
+            if isinstance(user, discord.Member):
+                return user
+            if ctx.guild:
+                return ctx.guild.get_member(user.id)
+            return None
+        return ctx.author
+
+    async def check_mod_permission(self, ctx, required_level: str):
+        actor = self._get_actor(ctx)
+        if actor is None:
+            raise commands.CheckFailure("This command can only be used by a guild member.")
+
+        internal_level = self.get_level(actor.id, ctx.guild.id)
+
+        if PERM_LEVELS.get(internal_level, 0) < PERM_LEVELS.get(required_level, 0):
+            raise commands.CheckFailure(
+                f"Only **{required_level.replace('_', ' ').title()}**+ can use this command."
+            )
+
+        # If not a bot owner, ensure the user actually has the Discord role
+        if internal_level != "bot_owner":
+            role_id = self.staff_role_ids.get(required_level)
+            if role_id is not None and not actor.get_role(role_id):
+                raise commands.CheckFailure(
+                    "Your Discord staff role is missing, so this action is blocked."
+                )
+
+    def can_target(self, actor: discord.Member, target: discord.Member) -> tuple[bool, Optional[str]]:
+        guild = actor.guild
+        if actor == target:
+            return False, "You cannot target yourself."
+        if target.id == guild.owner_id:
+            return False, "You cannot target the server owner."
+        if target.id in self.owners or target.id == self.bot.owner_id:
+            return False, "You cannot target a bot owner."
+
+        actor_internal = PERM_LEVELS.get(self.get_level(actor.id, guild.id), 0)
+        target_internal = PERM_LEVELS.get(self.get_level(target.id, guild.id), 0)
+        if target_internal > actor_internal:
+            return False, "Target has a higher internal staff level than you."
+
+        if actor.top_role <= target.top_role:
+            return False, "Your top role must be above the target's top role."
+        if guild.me.top_role <= target.top_role:
+            return False, "My top role must be above the target's top role."
+
+        return True, None
+
+    # ---------------------------------------------------------------
+    #  Permission level lookup (guild‑scoped)
+    # ---------------------------------------------------------------
+    def get_level(self, user_id: int, guild_id: Optional[int] = None) -> str:
         if user_id == self.bot.owner_id or user_id in self.owners:
             return "bot_owner"
-        uid = str(user_id)
-        for singular, plural in [
-            ("founder", "founders"),
-            ("manager", "managers"),
-            ("head_admin", "head_admins"),
-            ("admin", "admins"),
-            ("bot_manager", "bot_managers"),
-            ("event_manager", "event_managers"),
-            ("moderator", "moderators"),
-            ("trial_moderator", "trial_moderators"),
-        ]:
-            if uid in self.staff_cache.get(plural, []):
-                return singular
+
+        if guild_id is not None:
+            staff_roles = self.staff_cache.get(guild_id, {})
+            for singular, plural in [
+                ("founder", "founders"),
+                ("manager", "managers"),
+                ("head_admin", "head_admins"),
+                ("admin", "admins"),
+                ("bot_manager", "bot_managers"),
+                ("event_manager", "event_managers"),
+                ("moderator", "moderators"),
+                ("trial_moderator", "trial_moderators"),
+            ]:
+                if str(user_id) in staff_roles.get(plural, []):
+                    return singular
+        else:
+            for gid, staff_roles in self.staff_cache.items():
+                for singular, plural in [
+                    ("founder", "founders"),
+                    ("manager", "managers"),
+                    ("head_admin", "head_admins"),
+                    ("admin", "admins"),
+                    ("bot_manager", "bot_managers"),
+                    ("event_manager", "event_managers"),
+                    ("moderator", "moderators"),
+                    ("trial_moderator", "trial_moderators"),
+                ]:
+                    if str(user_id) in staff_roles.get(plural, []):
+                        return singular
         return "user"
 
-    def can_target(self, actor: discord.Member, target: discord.Member) -> bool:
-        if actor == target:
-            return False
-        if target.id in self.owners or target.id == self.bot.owner_id:
-            return False
-        actor_level = PERM_LEVELS.get(self.get_level(actor.id), 0)
-        target_level = PERM_LEVELS.get(self.get_level(target.id), 0)
-        if actor_level > target_level:
-            return True
-        if target.top_role >= actor.top_role:
-            return False
-        return True
-
+    # ---------------------------------------------------------------
+    #  Utility methods
+    # ---------------------------------------------------------------
     async def log_action(self, ctx, action: str, target: discord.User, reason: str = None, extra: str = None):
         channel = self.get_log_channel()
         if not channel:
@@ -532,7 +623,9 @@ class Moderation(commands.Cog):
         try:
             await channel.send(embed=embed)
         except discord.Forbidden:
-            pass
+            logger.warning("Cannot send log to channel %s", self.log_channel_id)
+        except discord.HTTPException as e:
+            logger.error("Failed to send log: %s", e)
 
     def get_log_channel(self) -> Optional[discord.TextChannel]:
         return self.bot.get_channel(self.log_channel_id)
@@ -583,54 +676,175 @@ class Moderation(commands.Cog):
         await self._try_dm(member, embed)
 
     async def _record_modstat(self, user_id: int, command_name: str):
-        uid = str(user_id)
-        if uid not in self.modstats:
-            self.modstats[uid] = {}
-        self.modstats[uid][command_name] = self.modstats[uid].get(command_name, 0) + 1
         await self.db.execute(
             "INSERT INTO modstats (user_id, command, count) VALUES ($1, $2, 1) "
             "ON CONFLICT (user_id, command) DO UPDATE SET count = modstats.count + 1",
             user_id, command_name
         )
+        uid = str(user_id)
+        if uid not in self.modstats:
+            self.modstats[uid] = {}
+        self.modstats[uid][command_name] = self.modstats[uid].get(command_name, 0) + 1
 
-    # ══════════════════════════════════════════════════
-    #  SNIPE COMMANDS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
+    #  Anti‑phishing / word filter helper
+    # ---------------------------------------------------------------
+    def _normalize_domain(self, raw: str) -> Optional[str]:
+        raw = raw.strip().lower()
+        if not raw:
+            return None
+        if not raw.startswith(("http://", "https://")):
+            raw = "http://" + raw
+        try:
+            parsed = urlparse(raw)
+            host = parsed.hostname
+        except Exception:
+            return None
+        if not host:
+            return None
+        try:
+            host = host.encode("idna").decode("ascii")
+        except Exception:
+            return None
+        return host.rstrip(".")
+
+    def _registered_domain(self, host: str) -> str:
+        if TLDEXTRACT_AVAILABLE:
+            ext = tldextract.extract(host)
+            return f"{ext.domain}.{ext.suffix}"
+        return host
+
+    def _normalize_text(self, text: str) -> str:
+        text = unicodedata.normalize("NFKC", text).lower()
+        text = re.sub(r"[\u200b-\u200d\ufeff]", "", text)
+        text = re.sub(r"(.)\1{2,}", r"\1\1", text)
+        return text
+
+    def contains_banned_word(self, text: str) -> bool:
+        normalized = self._normalize_text(text)
+        for banned in self.banned_words:
+            banned_norm = self._normalize_text(banned)
+            if not banned_norm:
+                continue
+            pattern = rf"(?<!\w){re.escape(banned_norm)}(?!\w)"
+            if re.search(pattern, normalized):
+                return True
+        return False
+
+    async def is_phishing(self, content: str) -> bool:
+        words = re.findall(r'https?://[^\s]+|[^\s]+\.[^\s]+', content)
+        for word in words:
+            word = word.rstrip(".,;:!?)]}>\"'")
+            host = self._normalize_domain(word)
+            if not host:
+                continue
+            host_reg = self._registered_domain(host)
+            for blocked in self.phish_domains:
+                blocked_host = self._normalize_domain(blocked)
+                if blocked_host:
+                    blocked_reg = self._registered_domain(blocked_host)
+                    if host_reg == blocked_reg or host == blocked_host:
+                        return True
+        return False
+
+    # ---------------------------------------------------------------
+    #  Event listeners for moderation
+    # ---------------------------------------------------------------
     @commands.Cog.listener()
-    async def on_message_delete(self, message: discord.Message):
+    async def on_message(self, message):
+        if message.author.bot or not message.guild:
+            return
+
+        ctx = await self.bot.get_context(message)
+        if ctx.valid:
+            return  # Let commands handle themselves
+
+        # Skip staff / allowed roles
+        actor = message.author
+        if await self._bypass_filters(actor):
+            return
+
+        # Anti‑phishing
+        if self.antiphish_enabled and self.phish_domains and await self.is_phishing(message.content):
+            try:
+                await message.delete()
+                await message.channel.send(f"{message.author.mention} Phishing links are not allowed.", delete_after=5)
+                await self.log_action(ctx, "Anti‑Phishing", message.author, "Deleted phishing message")
+            except discord.Forbidden:
+                logger.warning("Cannot delete phishing message in %s", message.channel.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to delete phishing message: %s", e)
+            return
+
+        # Word filter
+        if self.wordfilter_enabled and self.banned_words and self.contains_banned_word(message.content):
+            try:
+                await message.delete()
+                await message.channel.send(f"{message.author.mention} Your message contained a banned word.", delete_after=5)
+                await self.log_action(ctx, "Word Filter", message.author, "Deleted filtered message")
+            except discord.Forbidden:
+                logger.warning("Cannot delete filtered message in %s", message.channel.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to delete filtered message: %s", e)
+
+    async def _bypass_filters(self, member: discord.Member) -> bool:
+        # Staff bypass
+        level = self.get_level(member.id, member.guild.id)
+        if level != "user":
+            return True
+        # Allowed roles bypass
+        for role in member.roles:
+            if role.id in self.allowed_link_role_ids:
+                return True
+        return False
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
         if not message.guild:
             return
         self.snipe_data[message.channel.id].appendleft({
-            "author": message.author,
+            "author_id": message.author.id,
             "content": message.content,
-            "timestamp": message.created_at,
-            "attachments": [a.url for a in message.attachments],
+            "timestamp": int(message.created_at.timestamp()),
+            "attachment_urls": [a.url for a in message.attachments],
         })
 
     @commands.Cog.listener()
-    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+    async def on_message_edit(self, before, after):
         if not before.guild or before.author.bot or before.content == after.content:
             return
         self.edit_snipe_data[before.channel.id].appendleft({
-            "author": before.author,
+            "author_id": before.author.id,
             "old_content": before.content,
             "new_content": after.content,
-            "timestamp": before.created_at,
+            "timestamp": int(before.created_at.timestamp()),
         })
 
     @commands.Cog.listener()
-    async def on_reaction_remove(self, reaction: discord.Reaction, user: discord.User):
+    async def on_reaction_remove(self, reaction, user):
         if not reaction.message.guild:
             return
         self.reaction_snipe_data[reaction.message.channel.id].appendleft({
             "message_id": reaction.message.id,
-            "user": user,
+            "user_id": user.id,
             "emoji": str(reaction.emoji),
-            "timestamp": discord.utils.utcnow(),
+            "timestamp": int(discord.utils.utcnow().timestamp()),
             "message_content": reaction.message.content[:200] if reaction.message.content else None,
-            "message_author": reaction.message.author,
+            "message_author_id": reaction.message.author.id if reaction.message.author else None,
         })
 
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        if before.nick != after.nick:
+            await self.db.execute(
+                "INSERT INTO nick_history (guild_id, user_id, old_nick, new_nick, timestamp) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                after.guild.id, after.id, before.nick, after.nick, int(time.time())
+            )
+
+    # ---------------------------------------------------------------
+    #  SNIPE COMMANDS (ID‑based)
+    # ---------------------------------------------------------------
     async def _snipe_logic(self, ctx, index: int = 1, channel: discord.TextChannel = None):
         chan = channel or ctx.channel
         entries = self.snipe_data.get(chan.id, deque())
@@ -639,14 +853,15 @@ class Moderation(commands.Cog):
         if index < 1 or index > len(entries):
             return await self.send(ctx, error_embed(ctx, f"Index out of range (1-{len(entries)})."))
         data = entries[index - 1]
+        author = self.bot.get_user(data["author_id"])
+        author_text = author.mention if author else f"<@{data['author_id']}>"
         embed = make_embed(ctx, f"{EMOJI_SNIPE} Sniped Message #{index}", "", MAIN_COLOR)
-        embed.add_field(name="Author", value=data["author"].mention, inline=True)
+        embed.add_field(name="Author", value=author_text, inline=True)
         embed.add_field(name="Channel", value=chan.mention, inline=True)
         embed.add_field(name="Content", value=data["content"] or "*No text content*", inline=False)
-        if data["attachments"]:
-            embed.add_field(name="Attachments", value="\n".join(data["attachments"]), inline=False)
-        embed.set_thumbnail(url=data["author"].display_avatar.url)
-        embed.set_footer(text=f"Deleted • {data['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}")
+        if data["attachment_urls"]:
+            embed.add_field(name="Attachments", value="\n".join(data["attachment_urls"]), inline=False)
+        embed.set_footer(text=f"Deleted • <t:{data['timestamp']}:f>")
         await self.send(ctx, embed)
 
     @commands.command(aliases=["sn", "s"])
@@ -662,13 +877,14 @@ class Moderation(commands.Cog):
         if index < 1 or index > len(entries):
             return await self.send(ctx, error_embed(ctx, f"Index out of range (1-{len(entries)})."))
         data = entries[index - 1]
+        author = self.bot.get_user(data["author_id"])
+        author_text = author.mention if author else f"<@{data['author_id']}>"
         embed = make_embed(ctx, f"{EMOJI_SNIPE} Edit Sniped #{index}", "", 0x2ECC71)
-        embed.add_field(name="Author", value=data["author"].mention, inline=True)
+        embed.add_field(name="Author", value=author_text, inline=True)
         embed.add_field(name="Channel", value=chan.mention, inline=True)
         embed.add_field(name="Before", value=data["old_content"] or "*empty*", inline=False)
         embed.add_field(name="After", value=data["new_content"] or "*empty*", inline=False)
-        embed.set_thumbnail(url=data["author"].display_avatar.url)
-        embed.set_footer(text=f"Edited • {data['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}")
+        embed.set_footer(text=f"Edited • <t:{data['timestamp']}:f>")
         await self.send(ctx, embed)
 
     @commands.command(aliases=["es"])
@@ -684,15 +900,19 @@ class Moderation(commands.Cog):
         if index < 1 or index > len(entries):
             return await self.send(ctx, error_embed(ctx, f"Index out of range (1-{len(entries)})."))
         data = entries[index - 1]
+        user = self.bot.get_user(data["user_id"])
+        user_text = user.mention if user else f"<@{data['user_id']}>"
         embed = make_embed(ctx, f"{EMOJI_SNIPE} Reaction Sniped #{index}", "", 0xE91E63)
-        embed.add_field(name="User", value=data["user"].mention, inline=True)
+        embed.add_field(name="User", value=user_text, inline=True)
         embed.add_field(name="Emoji", value=data["emoji"], inline=True)
         embed.add_field(name="Channel", value=chan.mention, inline=True)
         if data["message_content"]:
             embed.add_field(name="Message", value=data["message_content"][:500], inline=False)
-        if data["message_author"]:
-            embed.add_field(name="Message Author", value=data["message_author"].mention, inline=True)
-        embed.set_footer(text=f"Reaction removed • {data['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}")
+        if data["message_author_id"]:
+            msg_author = self.bot.get_user(data["message_author_id"])
+            if msg_author:
+                embed.add_field(name="Message Author", value=msg_author.mention, inline=True)
+        embed.set_footer(text=f"Reaction removed • <t:{data['timestamp']}:f>")
         await self.send(ctx, embed)
 
     @commands.command(name="snipereaction", aliases=["sr"])
@@ -700,9 +920,9 @@ class Moderation(commands.Cog):
     async def snipereaction(self, ctx, index: int = 1, channel: discord.TextChannel = None):
         await self._snipereaction_logic(ctx, index, channel)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  SET LOG CHANNEL
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="setlogchannel")
     @require("admin")
     async def setlogchannel(self, ctx, channel: discord.TextChannel):
@@ -714,9 +934,9 @@ class Moderation(commands.Cog):
         )
         await self.send(ctx, success_embed(ctx, f"Log channel set to {channel.mention}."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  ANTI‑PHISHING COMMANDS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="antiphish", invoke_without_command=True)
     @require("admin")
     async def antiphish_group(self, ctx):
@@ -765,9 +985,9 @@ class Moderation(commands.Cog):
         desc = "\n".join(f"• `{d}`" for d in self.phish_domains)
         await self.send(ctx, make_embed(ctx, f"{EMOJI_FISHING_POLE} Phishing Domains", desc, MAIN_COLOR))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  WORD FILTER COMMANDS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="wordfilter", invoke_without_command=True)
     @require("admin")
     async def wordfilter_group(self, ctx):
@@ -816,16 +1036,16 @@ class Moderation(commands.Cog):
         desc = "\n".join(f"• `{w}`" for w in self.banned_words)
         await self.send(ctx, make_embed(ctx, f"{EMOJI_INPUT_LATIN_LETTERS} Banned Words", desc, MAIN_COLOR))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  NICKNAME HISTORY
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="nickhistory", aliases=["nh"])
     @require("moderator")
     async def nickhistory(self, ctx, member: discord.Member):
         rows = await self.db.fetch(
             "SELECT old_nick, new_nick, timestamp FROM nick_history "
-            "WHERE user_id = $1 ORDER BY timestamp DESC LIMIT 20",
-            member.id
+            "WHERE guild_id = $1 AND user_id = $2 ORDER BY timestamp DESC LIMIT 20",
+            ctx.guild.id, member.id
         )
         if not rows:
             return await self.send(ctx, error_embed(ctx, "No nickname history found for that user."))
@@ -836,9 +1056,9 @@ class Moderation(commands.Cog):
         embed.set_thumbnail(url=member.display_avatar.url)
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  UNBAN ALL
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="unbanall")
     @require("bot_owner")
     async def unbanall(self, ctx):
@@ -850,14 +1070,16 @@ class Moderation(commands.Cog):
             try:
                 await ctx.guild.unban(ban_entry.user, reason="Mass unban")
                 count += 1
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning("Cannot unban %s: missing permissions", ban_entry.user.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to unban %s: %s", ban_entry.user.id, e)
             await asyncio.sleep(0.5)
         await self.send(ctx, success_embed(ctx, f"Unbanned **{count}** users."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  OWNER MANAGEMENT
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="owner", invoke_without_command=True)
     @require("bot_owner")
     async def owner_group(self, ctx):
@@ -921,9 +1143,9 @@ class Moderation(commands.Cog):
         )
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  BLACKLIST
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.hybrid_group(name="blacklist", aliases=["bl"])
     @require("bot_owner")
     async def blacklist_group(self, ctx):
@@ -964,9 +1186,9 @@ class Moderation(commands.Cog):
             ctx, f"{EMOJI_BARRIER_BLOCK} Blacklisted Users", desc, LOSS_COLOR
         ))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  BOT UTILITIES
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["latency"])
     async def ping(self, ctx):
         await self.send(ctx, make_embed(
@@ -983,9 +1205,9 @@ class Moderation(commands.Cog):
             ctx, f"{EMOJI_SUCCESS} Uptime", f"{EMOJI_COOLDOWN} `{h}h {m}m {s}s`", MAIN_COLOR
         ))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  TIMEZONE COMMANDS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="timezone", invoke_without_command=True)
     async def timezone_group(self, ctx):
         embed = make_embed(ctx, "Timezone Commands",
@@ -1062,9 +1284,9 @@ class Moderation(commands.Cog):
         embed.set_thumbnail(url=target.display_avatar.url)
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  TRANSLATE COMMAND
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="tr", aliases=["translate"])
     async def translate_command(self, ctx, *, text_and_lang: str = None):
         if not TRANSLATOR_AVAILABLE:
@@ -1101,9 +1323,9 @@ class Moderation(commands.Cog):
         except Exception as e:
             await self.send(ctx, error_embed(ctx, f"Translation failed: {str(e)[:100]}"))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  PURGE (Advanced)
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     DEFAULT_PURGE_AMOUNT = 10
 
     async def _purge_logic(self, ctx, amount: int = 10, mode: str = "all", user: discord.Member = None,
@@ -1224,9 +1446,9 @@ class Moderation(commands.Cog):
 
         return await self._purge_logic(ctx, self.DEFAULT_PURGE_AMOUNT, "all")
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  CLEAR (bot / user subcommands)
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="clearmsg", aliases=["clr"], invoke_without_command=True)
     @require("trial_moderator")
     async def clearmsg_group(self, ctx, amount: int = 10):
@@ -1247,21 +1469,26 @@ class Moderation(commands.Cog):
     async def clearmsg_all(self, ctx, amount: int = 10):
         await self._purge_logic(ctx, amount, "all")
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  SLOWMODE
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["sm"])
     @require("admin")
     async def slowmode(self, ctx, seconds: int):
         if seconds < 0:
             return await self.send(ctx, error_embed(ctx, "Seconds cannot be negative."))
-        await ctx.channel.edit(slowmode_delay=seconds)
+        try:
+            await ctx.channel.edit(slowmode_delay=seconds)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Manage Channels permission."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to set slowmode: {e}"))
         msg = "**disabled**" if seconds == 0 else f"set to **{seconds}s**"
         await self.send(ctx, make_embed(ctx, f"{EMOJI_LOCK} Slowmode", f"Slowmode {msg}.", 0xF1C40F))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  LOCK / UNLOCK
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command()
     @require("admin")
     async def lock(self, ctx, channel: discord.TextChannel = None):
@@ -1277,23 +1504,28 @@ class Moderation(commands.Cog):
             if role.permissions.administrator:
                 continue
             overwrite = chan.overwrites_for(role)
-            snapshot[str(role.id)] = overwrite.send_messages
+            pair = overwrite.pair()
+            snapshot[str(role.id)] = {
+                "allow": pair[0],
+                "deny": pair[1],
+            }
             new_overwrite = discord.PermissionOverwrite.from_pair(
-                allow=overwrite.pair()[0],
-                deny=overwrite.pair()[1]
+                allow=pair[0],
+                deny=pair[1],
             )
             new_overwrite.send_messages = False
             try:
-                await chan.set_permissions(role, overwrite=new_overwrite, reason=f"Locked by {ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user}")
-            except Exception:
-                pass
+                await chan.set_permissions(role, overwrite=new_overwrite, reason="Locked")
+            except discord.Forbidden:
+                logger.warning("Cannot set permissions for role %s in channel %s", role.id, chan.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to set permissions for role %s: %s", role.id, e)
 
         await self.db.execute(
             "INSERT INTO lockstate (channel_id, data) VALUES ($1, $2::jsonb) "
             "ON CONFLICT (channel_id) DO UPDATE SET data = EXCLUDED.data",
             chan.id, json.dumps(snapshot)
         )
-
         await self.send(ctx, make_embed(
             ctx, f"{EMOJI_LOCK} Locked",
             f"{chan.mention} is now **locked** for everyone except Administrators.", 0xE67E22
@@ -1309,66 +1541,99 @@ class Moderation(commands.Cog):
         if row is None:
             try:
                 await chan.set_permissions(guild.default_role, send_messages=None)
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning("Cannot reset default role permissions in channel %s", chan.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to reset default role permissions: %s", e)
             return await self.send(ctx, make_embed(
                 ctx, f"{EMOJI_UNLOCK} Unlocked",
                 f"{chan.mention} is now **unlocked**. (No prior lock snapshot found, restored default.)", WIN_COLOR
             ))
 
         snapshot = json.loads(row["data"])
-        for role_id_str, prior_value in snapshot.items():
+        for role_id_str, data in snapshot.items():
             role = guild.get_role(int(role_id_str))
-            if not role:
+            if role is None:
                 continue
-            overwrite = chan.overwrites_for(role)
-            overwrite.send_messages = prior_value
+            restored = discord.PermissionOverwrite.from_pair(
+                allow=data["allow"],
+                deny=data["deny"],
+            )
             try:
-                if overwrite.is_empty():
-                    await chan.set_permissions(role, overwrite=None, reason="Unlocked, overwrite removed")
+                if restored.is_empty():
+                    await chan.set_permissions(role, overwrite=None, reason="Unlocked")
                 else:
-                    await chan.set_permissions(role, overwrite=overwrite, reason="Unlocked, restored prior state")
-            except Exception:
-                pass
+                    await chan.set_permissions(role, overwrite=restored, reason="Unlocked")
+            except discord.Forbidden:
+                logger.warning("Cannot restore permissions for role %s in channel %s", role.id, chan.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to restore permissions for role %s: %s", role.id, e)
 
         await self.db.execute("DELETE FROM lockstate WHERE channel_id = $1", chan.id)
-
         await self.send(ctx, make_embed(
             ctx, f"{EMOJI_UNLOCK} Unlocked",
             f"{chan.mention} is now **unlocked**. Original permissions restored.", WIN_COLOR
         ))
 
-    # ══════════════════════════════════════════════════
-    #  WARNS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
+    #  WARNS (transaction‑safe, threshold crossing, guild‑scoped)
+    # ---------------------------------------------------------------
     async def _warn_logic(self, ctx, member: discord.Member, reason: str = "No reason"):
-        actor = ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot warn this user."))
-        await self.db.execute(
-            "INSERT INTO warnings (user_id, moderator_id, reason, timestamp, countable) "
-            "VALUES ($1, $2, $3, $4, TRUE)",
-            member.id, actor.id, reason, int(time.time())
-        )
-        total_countable = await self.db.fetchval(
-            "SELECT COUNT(*) FROM warnings WHERE user_id = $1 AND countable = TRUE",
-            member.id
-        )
+        actor = self._get_actor(ctx)
+        try:
+            await self.check_mod_permission(ctx, "trial_moderator")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+
+        should_punish = False
+        new_count = 0
+
+        async with self.bot.pool.acquire() as conn:
+            async with conn.transaction():
+                lock_key = ((ctx.guild.id << 22) ^ member.id) & 0x7FFFFFFFFFFFFFFF
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+
+                previous_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM warnings "
+                    "WHERE guild_id = $1 AND user_id = $2 AND countable = TRUE",
+                    ctx.guild.id, member.id
+                )
+
+                await conn.execute(
+                    "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, timestamp, countable) "
+                    "VALUES ($1, $2, $3, $4, $5, TRUE)",
+                    ctx.guild.id, member.id, actor.id, reason, int(time.time())
+                )
+
+                new_count = previous_count + 1
+                should_punish = (
+                    previous_count < self.warn_ban_threshold <= new_count
+                )
+
         embed = make_embed(
             ctx, f"{EMOJI_WARN} Warning Issued",
-            f"**User:** {member.mention}\n**Reason:** {reason}\n**Total Warns:** {total_countable}", WARN_COLOR
+            f"**User:** {member.mention}\n**Reason:** {reason}\n**Total Warns:** {new_count}",
+            WARN_COLOR
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         await self.send(ctx, embed)
         await self.log_action(ctx, "Warn", member, reason)
         await self._manual_dm(member, "Warning", reason)
         await self._record_modstat(actor.id, "warn")
-        # Auto-kick check
-        if total_countable % self.warn_kick_threshold == 0:
+
+        if should_punish:
             try:
-                await member.kick(reason=f"Automatic kick: reached {total_countable} warnings")
-            except Exception:
-                pass
+                # CHANGED: Ban instead of kick
+                await member.ban(reason=f"Automatic ban: reached {new_count} warnings")
+                await self.log_action(ctx, "Automatic Ban", member, reason)
+            except discord.Forbidden:
+                logger.error("Failed to auto-ban %s in guild %s: missing permissions", member.id, ctx.guild.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to auto-ban %s: HTTP %s", member.id, e.status)
 
     @commands.command(aliases=["w"])
     @require("trial_moderator")
@@ -1376,15 +1641,14 @@ class Moderation(commands.Cog):
         await self._warn_logic(ctx, member, reason)
 
     @app_commands.command(name="warn", description="Issue a warning to a member")
-    @app_commands.default_permissions(moderate_members=True)
     async def slash_warn(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
         await self._warn_logic(interaction, member, reason)
 
     async def _warnings_logic(self, ctx, member: discord.Member):
         rows = await self.db.fetch(
             "SELECT moderator_id, reason, timestamp, countable FROM warnings "
-            "WHERE user_id = $1 ORDER BY timestamp ASC",
-            member.id
+            "WHERE guild_id = $1 AND user_id = $2 ORDER BY timestamp ASC",
+            ctx.guild.id, member.id
         )
         if not rows:
             return await self.send(ctx, make_embed(
@@ -1411,13 +1675,13 @@ class Moderation(commands.Cog):
 
     async def _clearwarns_logic(self, ctx, member: discord.Member, index: Optional[int] = None):
         rows = await self.db.fetch(
-            "SELECT id, reason FROM warnings WHERE user_id = $1 ORDER BY id ASC",
-            member.id
+            "SELECT id, reason FROM warnings WHERE guild_id = $1 AND user_id = $2 ORDER BY id ASC",
+            ctx.guild.id, member.id
         )
         if not rows:
             return await self.send(ctx, make_embed(ctx, f"{EMOJI_ALERT} No Warnings", "Nothing to clear.", 0x95A5A6))
         if index is None:
-            await self.db.execute("DELETE FROM warnings WHERE user_id = $1", member.id)
+            await self.db.execute("DELETE FROM warnings WHERE guild_id = $1 AND user_id = $2", ctx.guild.id, member.id)
             await self.send(ctx, success_embed(ctx, f"All warnings for {member.mention} cleared."))
             await self.log_action(ctx, "Clear Warnings", member)
             return
@@ -1431,14 +1695,15 @@ class Moderation(commands.Cog):
         ))
         await self.log_action(ctx, "Clear Warning (Indexed)", member, f"Removed warn #{index}: {reason}")
 
-    @commands.command(aliases=["cw", "warnremove"])
+    # CHANGED: Added aliases for easier warning removal
+    @commands.command(aliases=["cw", "warnremove", "removewarn", "deletewarn"])
     @require("admin")
     async def clearwarns(self, ctx, member: discord.Member, index: Optional[int] = None):
         await self._clearwarns_logic(ctx, member, index)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  MODSTATS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="modstats", invoke_without_command=True)
     @require("admin")
     async def modstats_group(self, ctx):
@@ -1505,36 +1770,52 @@ class Moderation(commands.Cog):
         embed.set_thumbnail(url=user.display_avatar.url)
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  NICKNAME
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["nick"])
     @require("trial_moderator")
     async def nickname(self, ctx, member: discord.Member, *, nick: str = None):
         if nick and len(nick) > 32:
             return await self.send(ctx, error_embed(ctx, "Nickname must be **32 characters** or fewer."))
-        await member.edit(nick=nick)
+        try:
+            await member.edit(nick=nick)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Manage Nicknames permission or cannot edit this member."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to change nickname: {e}"))
         if nick:
             await self.send(ctx, success_embed(ctx, f"{member.mention} → **{nick}**"))
         else:
             await self.send(ctx, success_embed(ctx, f"Nickname reset for {member.mention}."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  SAY
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["echo"])
     @require("admin")
     async def say(self, ctx, channel: discord.TextChannel, *, text: str):
-        await channel.send(text)
+        try:
+            await channel.send(text)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I cannot send messages in that channel."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to send message: {e}"))
         await self.send(ctx, success_embed(ctx, f"Message sent to {channel.mention}."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  MUTE / UNMUTE
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     async def _mute_logic(self, ctx, member: discord.Member, duration: str, reason: str = "No reason"):
-        actor = ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot mute this user."))
+        actor = self._get_actor(ctx)
+        try:
+            await self.check_mod_permission(ctx, "trial_moderator")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+
         seconds = parse_time(duration)
         if seconds <= 0:
             return await self.send(ctx, error_embed(
@@ -1571,7 +1852,6 @@ class Moderation(commands.Cog):
         await self._mute_logic(ctx, member, duration, reason)
 
     @app_commands.command(name="mute", description="Timeout a member (e.g. 10m, 2h, 1d — max 28d)")
-    @app_commands.default_permissions(moderate_members=True)
     async def slash_mute(self, interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = "No reason"):
         await self._mute_logic(interaction, member, duration, reason)
 
@@ -1600,18 +1880,28 @@ class Moderation(commands.Cog):
         await self._unmute_logic(ctx, member)
 
     @app_commands.command(name="unmute", description="Remove a member's timeout early")
-    @app_commands.default_permissions(moderate_members=True)
     async def slash_unmute(self, interaction: discord.Interaction, member: discord.Member):
         await self._unmute_logic(interaction, member)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  KICK / BAN / UNBAN
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     async def _kick_logic(self, ctx, member: discord.Member, reason: str = "No reason"):
-        actor = ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot kick this user."))
-        await member.kick(reason=reason)
+        actor = self._get_actor(ctx)
+        try:
+            await self.check_mod_permission(ctx, "moderator")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+        try:
+            await member.kick(reason=reason)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Kick Members permission."))
+        except discord.HTTPException as e:
+            logger.error("Kick HTTP error: %s", e)
+            return await self.send(ctx, error_embed(ctx, f"Kick failed: {e}"))
         embed = make_embed(
             ctx, f"{EMOJI_DELETE} Member Kicked",
             f"**User:** {member.mention}\n**Reason:** {reason}", LOSS_COLOR
@@ -1628,15 +1918,25 @@ class Moderation(commands.Cog):
         await self._kick_logic(ctx, member, reason)
 
     @app_commands.command(name="kick", description="Kick a member from the server")
-    @app_commands.default_permissions(kick_members=True)
     async def slash_kick(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
         await self._kick_logic(interaction, member, reason)
 
     async def _ban_logic(self, ctx, member: discord.Member, reason: str = "No reason"):
-        actor = ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot ban this user."))
-        await member.ban(reason=reason)
+        actor = self._get_actor(ctx)
+        try:
+            await self.check_mod_permission(ctx, "admin")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+        try:
+            await member.ban(reason=reason)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Ban Members permission."))
+        except discord.HTTPException as e:
+            logger.error("Ban HTTP error: %s", e)
+            return await self.send(ctx, error_embed(ctx, f"Ban failed: {e}"))
         embed = make_embed(
             ctx, f"{EMOJI_DELETE} Member Banned",
             f"**User:** {member.mention}\n**Reason:** {reason}", LOSS_COLOR
@@ -1653,19 +1953,25 @@ class Moderation(commands.Cog):
         await self._ban_logic(ctx, member, reason)
 
     @app_commands.command(name="ban", description="Ban a member from the server")
-    @app_commands.default_permissions(ban_members=True)
     async def slash_ban(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
         await self._ban_logic(interaction, member, reason)
 
     async def _unban_logic(self, ctx, user: discord.User, reason: str = "No reason"):
-        bans = [e async for e in ctx.guild.bans()]
-        entry = discord.utils.get(bans, user__id=user.id)
-        if not entry:
-            return await self.send(ctx, error_embed(ctx, "That user is not banned."))
+        try:
+            bans = [e async for e in ctx.guild.bans()]
+            entry = discord.utils.get(bans, user__id=user.id)
+            if not entry:
+                return await self.send(ctx, error_embed(ctx, "That user is not banned."))
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Ban Members permission to view bans."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to fetch bans: {e}"))
         try:
             await ctx.guild.unban(user, reason=reason)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Ban Members permission."))
         except discord.HTTPException as e:
-            return await self.send(ctx, error_embed(ctx, f"Failed: {e}"))
+            return await self.send(ctx, error_embed(ctx, f"Failed to unban: {e}"))
         await self.send(ctx, success_embed(ctx, f"Unbanned **{user}** (`{user.id}`)"))
         await self.log_action(ctx, "Unban", user, reason)
 
@@ -1675,7 +1981,6 @@ class Moderation(commands.Cog):
         await self._unban_logic(ctx, user, reason)
 
     @app_commands.command(name="unban", description="Unban a user by Discord ID")
-    @app_commands.default_permissions(ban_members=True)
     async def slash_unban(self, interaction: discord.Interaction, user_id: str, reason: str = "No reason"):
         try:
             user = await self.bot.fetch_user(int(user_id))
@@ -1685,17 +1990,28 @@ class Moderation(commands.Cog):
             )
         await self._unban_logic(interaction, user, reason)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  SOFTBAN / HACKBAN
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["sb"])
     @require("admin")
     async def softban(self, ctx, member: discord.Member, *, reason: str = "No reason"):
         actor = ctx.author
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot softban this user."))
-        await member.ban(delete_message_days=7, reason=f"Softban: {reason}")
-        await ctx.guild.unban(member, reason="Softban unban")
+        try:
+            await self.check_mod_permission(ctx, "admin")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+        try:
+            await member.ban(delete_message_days=7, reason=f"Softban: {reason}")
+            await ctx.guild.unban(member, reason="Softban unban")
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Ban Members permission."))
+        except discord.HTTPException as e:
+            logger.error("Softban failed: %s", e)
+            return await self.send(ctx, error_embed(ctx, f"Softban failed: {e}"))
         embed = make_embed(
             ctx, f"{EMOJI_DELETE} Softbanned",
             f"**User:** {member.mention}\n**Reason:** {reason}\n> Messages from the past 7 days deleted.", WARN_COLOR
@@ -1714,6 +2030,8 @@ class Moderation(commands.Cog):
             return await self.send(ctx, error_embed(ctx, "User not found."))
         try:
             await ctx.guild.ban(discord.Object(id=user_id), reason=reason)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Ban Members permission."))
         except discord.HTTPException as e:
             return await self.send(ctx, error_embed(ctx, f"Failed: {e}"))
         await self.send(ctx, make_embed(
@@ -1722,39 +2040,77 @@ class Moderation(commands.Cog):
         ))
         await self.log_action(ctx, "Hackban", user, reason)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  JAIL / UNJAIL
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     async def _jail_logic(self, ctx, member: discord.Member, reason: str = "No reason"):
-        actor = ctx.author if not isinstance(ctx, discord.Interaction) else ctx.user
-        if not self.can_target(actor, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot jail this user."))
+        actor = self._get_actor(ctx)
+        try:
+            await self.check_mod_permission(ctx, "admin")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(actor, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
+
         guild = ctx.guild
-        role = discord.utils.get(guild.roles, name="Jailed") or await guild.create_role(name="Jailed")
-        roles_to_save = [r.id for r in member.roles if r != guild.default_role]
-        await member.edit(roles=[role])
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False, read_message_history=False),
-            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True),
-        }
-        ch = await guild.create_text_channel(f"jail-{member.name[:16]}", overwrites=overwrites)
-        jail_data = {
-            "roles": roles_to_save,
-            "channel": ch.id
-        }
-        await self.db.execute(
-            "INSERT INTO jail (user_id, data) VALUES ($1, $2::jsonb) "
-            "ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data",
-            member.id, json.dumps(jail_data)
-        )
-        await ch.send(f"{member.mention} jailed. Reason: {reason}")
-        embed = make_embed(
+        jail_role = guild.get_role(self.jail_role_id)
+        if jail_role is None:
+            return await self.send(ctx, error_embed(ctx, "Jail role is not configured."))
+        if jail_role in member.roles:
+            return await self.send(ctx, error_embed(ctx, f"{member.mention} is already jailed."))
+
+        old_roles = [role for role in member.roles if role != guild.default_role and role != jail_role]
+
+        try:
+            await member.edit(roles=[jail_role], reason=f"Jailed by {actor}: {reason}")
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Manage Roles permission."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to jail: {e}"))
+
+        try:
+            await self.db.execute(
+                """
+                INSERT INTO jail
+                (guild_id, user_id, role_ids, channel_id, reason, moderator_id, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET
+                    role_ids = EXCLUDED.role_ids,
+                    channel_id = EXCLUDED.channel_id,
+                    reason = EXCLUDED.reason,
+                    moderator_id = EXCLUDED.moderator_id,
+                    created_at = EXCLUDED.created_at
+                """,
+                guild.id, member.id,
+                [r.id for r in old_roles],
+                self.jail_channel_id,
+                reason,
+                actor.id,
+                int(time.time())
+            )
+        except Exception:
+            await member.edit(roles=old_roles, reason="Jail state save failed, restoring roles")
+            logger.exception("Failed to persist jail state for guild=%s user=%s", guild.id, member.id)
+            return await self.send(ctx, error_embed(ctx, "Failed to save jail state. Roles were restored."))
+
+        # Send a message to the jail channel if configured
+        if self.jail_channel_id:
+            jail_channel = guild.get_channel(self.jail_channel_id)
+            if jail_channel:
+                try:
+                    await jail_channel.send(f"{member.mention} has been jailed by {actor.mention}. Reason: {reason}")
+                except discord.Forbidden:
+                    logger.warning("Cannot send to jail channel %s", self.jail_channel_id)
+                except discord.HTTPException as e:
+                    logger.error("Failed to send to jail channel: %s", e)
+
+        await self.send(ctx, make_embed(
             ctx, f"{EMOJI_LOCK} Jailed",
-            f"**User:** {member.mention}\n**Cell:** {ch.mention}\n**Reason:** {reason}", 0x2C3E50
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await self.send(ctx, embed)
+            f"**User:** {member.mention}\n**Reason:** {reason}",
+            0x2C3E50,
+        ))
         await self.log_action(ctx, "Jail", member, reason)
         await self._record_modstat(actor.id, "jail")
 
@@ -1767,30 +2123,47 @@ class Moderation(commands.Cog):
     @require("admin")
     async def unjail(self, ctx, member: discord.Member):
         guild = ctx.guild
-        row = await self.db.fetchrow("SELECT data FROM jail WHERE user_id = $1", member.id)
+        row = await self.db.fetchrow(
+            "SELECT role_ids, channel_id FROM jail WHERE guild_id = $1 AND user_id = $2",
+            guild.id, member.id
+        )
         if not row:
             return await self.send(ctx, error_embed(ctx, "User is not jailed."))
-        info = json.loads(row["data"])
-        roles = [guild.get_role(r) for r in info.get("roles", []) if guild.get_role(r)]
-        await member.edit(roles=roles)
-        ch = guild.get_channel(info.get("channel", 0))
-        if ch:
-            await ch.delete()
-        await self.db.execute("DELETE FROM jail WHERE user_id = $1", member.id)
+
+        roles = []
+        for role_id in row["role_ids"]:
+            role = guild.get_role(role_id)
+            if role:
+                roles.append(role)
+
+        try:
+            await member.edit(roles=roles)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Manage Roles permission to restore roles."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to restore roles: {e}"))
+
+        await self.db.execute("DELETE FROM jail WHERE guild_id = $1 AND user_id = $2", guild.id, member.id)
+
         await self.send(ctx, make_embed(
             ctx, f"{EMOJI_UNLOCK} Unjailed",
             f"{member.mention} has been released.", WIN_COLOR
         ))
         await self.log_action(ctx, "Unjail", member)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  AUDIT LOG
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     async def _audit_logic(self, ctx, count: int):
         if not ctx.guild.me.guild_permissions.view_audit_log:
             return await self.send(ctx, error_embed(ctx, "I lack **View Audit Log** permission."))
         count = max(1, min(count, 25))
-        entries = [e async for e in ctx.guild.audit_logs(limit=count)]
+        try:
+            entries = [e async for e in ctx.guild.audit_logs(limit=count)]
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack **View Audit Log** permission."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to fetch audit log: {e}"))
         if not entries:
             return await self.send(ctx, error_embed(ctx, "No audit log entries found."))
         embed = discord.Embed(
@@ -1817,9 +2190,9 @@ class Moderation(commands.Cog):
     async def audit(self, ctx, count: int = 5):
         await self._audit_logic(ctx, count)
 
-    # ══════════════════════════════════════════════════
-    #  STAFF MANAGEMENT
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
+    #  STAFF MANAGEMENT (guild‑scoped)
+    # ---------------------------------------------------------------
     @commands.group(name="staff", invoke_without_command=True)
     @require("head_admin")
     async def staff_group(self, ctx):
@@ -1838,17 +2211,18 @@ class Moderation(commands.Cog):
         plural = STAFF_ROLE_MAP.get(role)
         if not plural:
             return await self.send(ctx, error_embed(ctx, f"Invalid role `{role}`. Use one of: {', '.join(set(STAFF_ROLE_MAP.keys()))}"))
-        adder_level = PERM_LEVELS[self.get_level(ctx.author.id)]
+        adder_level = PERM_LEVELS[self.get_level(ctx.author.id, ctx.guild.id)]
         target_level = PERM_LEVELS[role] if role in PERM_LEVELS else 0
         if adder_level <= target_level:
             return await self.send(ctx, error_embed(ctx, "You cannot add someone to an equal or higher role."))
+        gid = ctx.guild.id
         uid = str(user.id)
-        if uid in self.staff_cache.get(plural, []):
+        if uid in self.staff_cache[gid][plural]:
             return await self.send(ctx, error_embed(ctx, f"{user.mention} is already a **{role}**."))
-        self.staff_cache[plural].append(uid)
+        self.staff_cache[gid][plural].append(uid)
         await self.db.execute(
-            "INSERT INTO staff (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            user.id, role
+            "INSERT INTO staff (guild_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            gid, user.id, role
         )
         await self.send(ctx, success_embed(ctx, f"{user.mention} added to **{role.replace('_', ' ').title()}**."))
 
@@ -1857,8 +2231,10 @@ class Moderation(commands.Cog):
         if disc_role:
             try:
                 await user.add_roles(disc_role)
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning("Cannot add role %s to %s in guild %s", role_id, user.id, gid)
+            except discord.HTTPException as e:
+                logger.error("Failed to add role: %s", e)
 
     @staff_group.command(name="remove")
     @require("founder")
@@ -1867,13 +2243,14 @@ class Moderation(commands.Cog):
         plural = STAFF_ROLE_MAP.get(role)
         if not plural:
             return await self.send(ctx, error_embed(ctx, f"Invalid role `{role}`."))
+        gid = ctx.guild.id
         uid = str(user.id)
-        if uid not in self.staff_cache.get(plural, []):
+        if uid not in self.staff_cache[gid][plural]:
             return await self.send(ctx, error_embed(ctx, f"{user.mention} is not a **{role}**."))
-        self.staff_cache[plural].remove(uid)
+        self.staff_cache[gid][plural].remove(uid)
         await self.db.execute(
-            "DELETE FROM staff WHERE user_id = $1 AND role = $2",
-            user.id, role
+            "DELETE FROM staff WHERE guild_id = $1 AND user_id = $2 AND role = $3",
+            gid, user.id, role
         )
         await self.send(ctx, success_embed(ctx, f"{user.mention} removed from **{role.replace('_', ' ').title()}**."))
 
@@ -1882,8 +2259,10 @@ class Moderation(commands.Cog):
         if disc_role:
             try:
                 await user.remove_roles(disc_role)
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning("Cannot remove role %s from %s in guild %s", role_id, user.id, gid)
+            except discord.HTTPException as e:
+                logger.error("Failed to remove role: %s", e)
 
     @staff_group.command(name="list")
     @require("admin")
@@ -1910,76 +2289,147 @@ class Moderation(commands.Cog):
             embed.add_field(name=label, value="\n".join(lines), inline=True)
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  MASS MODERATION
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
+    MAX_MASS_ACTION = 50
+
+    class ConfirmView(discord.ui.View):
+        def __init__(self, ctx, action, targets):
+            super().__init__(timeout=60)
+            self.ctx = ctx
+            self.action = action
+            self.targets = targets
+            self.confirmed = False
+
+        @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+        async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.confirmed = True
+            self.stop()
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+            self.stop()
+
     @commands.command(name="masskick")
     @require("admin")
     async def masskick(self, ctx, members: commands.Greedy[discord.Member], *, reason: str = "No reason"):
-        valid = [m for m in members if self.can_target(ctx.author, m)]
+        if len(members) > self.MAX_MASS_ACTION:
+            return await self.send(ctx, error_embed(ctx, f"Maximum {self.MAX_MASS_ACTION} targets allowed."))
+        if len(members) > 10 and reason == "No reason":
+            return await self.send(ctx, error_embed(ctx, "A reason is required for mass actions over 10 targets."))
+
+        valid = []
+        for m in members:
+            ok, _ = self.can_target(ctx.author, m)
+            if ok:
+                valid.append(m)
         if not valid:
-            return await self.send(ctx, error_embed(ctx, "No kickable members provided."))
+            return await self.send(ctx, error_embed(ctx, "No valid targets."))
+
+        if len(valid) > 10:
+            view = self.ConfirmView(ctx, "masskick", valid)
+            await self.send(ctx, make_embed(ctx, "Confirm Mass Kick", f"Kick {len(valid)} members?", WARN_COLOR), view=view)
+            await view.wait()
+            if not view.confirmed:
+                return await self.send(ctx, error_embed(ctx, "Mass kick cancelled."))
+
         msg = await self.send(ctx, make_embed(ctx, f"{EMOJI_COOLDOWN} Mass Kick", f"Kicking {len(valid)} members…", WARN_COLOR))
         done = failed = 0
         for m in valid:
             try:
                 await m.kick(reason=reason)
                 done += 1
-            except Exception:
+            except discord.Forbidden:
+                logger.warning("Cannot kick %s: missing permissions", m.id)
+                failed += 1
+            except discord.HTTPException as e:
+                logger.error("Failed to kick %s: %s", m.id, e)
                 failed += 1
             await asyncio.sleep(0.5)
+        result_embed = make_embed(
+            ctx, f"{EMOJI_SUCCESS} Mass Kick Complete",
+            f"{EMOJI_SUCCESS} Kicked: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
+        )
         if msg:
             try:
-                await msg.edit(embed=make_embed(
-                    ctx, f"{EMOJI_SUCCESS} Mass Kick Complete",
-                    f"{EMOJI_SUCCESS} Kicked: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
-                ))
+                await msg.edit(embed=result_embed)
             except Exception:
                 pass
         else:
-            await self.send(ctx, make_embed(
-                ctx, f"{EMOJI_SUCCESS} Mass Kick Complete",
-                f"{EMOJI_SUCCESS} Kicked: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
-            ))
+            await self.send(ctx, result_embed)
 
     @commands.command(name="massban")
     @require("admin")
     async def massban(self, ctx, members: commands.Greedy[discord.Member], *, reason: str = "No reason"):
-        valid = [m for m in members if self.can_target(ctx.author, m)]
+        if len(members) > self.MAX_MASS_ACTION:
+            return await self.send(ctx, error_embed(ctx, f"Maximum {self.MAX_MASS_ACTION} targets allowed."))
+        if len(members) > 10 and reason == "No reason":
+            return await self.send(ctx, error_embed(ctx, "A reason is required for mass actions over 10 targets."))
+
+        valid = []
+        for m in members:
+            ok, _ = self.can_target(ctx.author, m)
+            if ok:
+                valid.append(m)
         if not valid:
-            return await self.send(ctx, error_embed(ctx, "No bannable members provided."))
+            return await self.send(ctx, error_embed(ctx, "No valid targets."))
+
+        if len(valid) > 10:
+            view = self.ConfirmView(ctx, "massban", valid)
+            await self.send(ctx, make_embed(ctx, "Confirm Mass Ban", f"Ban {len(valid)} members?", WARN_COLOR), view=view)
+            await view.wait()
+            if not view.confirmed:
+                return await self.send(ctx, error_embed(ctx, "Mass ban cancelled."))
+
         msg = await self.send(ctx, make_embed(ctx, f"{EMOJI_COOLDOWN} Mass Ban", f"Banning {len(valid)} members…", WARN_COLOR))
         done = failed = 0
         for m in valid:
             try:
                 await m.ban(reason=reason)
                 done += 1
-            except Exception:
+            except discord.Forbidden:
+                logger.warning("Cannot ban %s: missing permissions", m.id)
+                failed += 1
+            except discord.HTTPException as e:
+                logger.error("Failed to ban %s: %s", m.id, e)
                 failed += 1
             await asyncio.sleep(0.5)
+        result_embed = make_embed(
+            ctx, f"{EMOJI_SUCCESS} Mass Ban Complete",
+            f"{EMOJI_SUCCESS} Banned: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
+        )
         if msg:
             try:
-                await msg.edit(embed=make_embed(
-                    ctx, f"{EMOJI_SUCCESS} Mass Ban Complete",
-                    f"{EMOJI_SUCCESS} Banned: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
-                ))
+                await msg.edit(embed=result_embed)
             except Exception:
                 pass
         else:
-            await self.send(ctx, make_embed(
-                ctx, f"{EMOJI_SUCCESS} Mass Ban Complete",
-                f"{EMOJI_SUCCESS} Banned: **{done}**\n{EMOJI_WRONG} Failed: **{failed}**", WIN_COLOR
-            ))
+            await self.send(ctx, result_embed)
 
     @commands.command(name="massmute")
     @require("admin")
     async def massmute(self, ctx, duration: str, members: commands.Greedy[discord.Member], *, reason: str = "No reason"):
+        if len(members) > self.MAX_MASS_ACTION:
+            return await self.send(ctx, error_embed(ctx, f"Maximum {self.MAX_MASS_ACTION} targets allowed."))
         seconds = parse_time(duration)
         if seconds <= 0:
             return await self.send(ctx, error_embed(ctx, "Invalid duration. Use `10m`, `1h`, `2d` etc."))
-        valid = [m for m in members if self.can_target(ctx.author, m)]
+        valid = []
+        for m in members:
+            ok, _ = self.can_target(ctx.author, m)
+            if ok:
+                valid.append(m)
         if not valid:
-            return await self.send(ctx, error_embed(ctx, "No mutable members provided."))
+            return await self.send(ctx, error_embed(ctx, "No valid targets."))
+
+        if len(valid) > 10:
+            view = self.ConfirmView(ctx, "massmute", valid)
+            await self.send(ctx, make_embed(ctx, "Confirm Mass Mute", f"Mute {len(valid)} members?", WARN_COLOR), view=view)
+            await view.wait()
+            if not view.confirmed:
+                return await self.send(ctx, error_embed(ctx, "Mass mute cancelled."))
+
         until = discord.utils.utcnow() + datetime.timedelta(seconds=seconds)
         msg = await self.send(ctx, make_embed(
             ctx, f"{EMOJI_COOLDOWN} Mass Mute", f"Timing out {len(valid)} members for {fmt_duration(seconds)}…", WARN_COLOR
@@ -1989,7 +2439,11 @@ class Moderation(commands.Cog):
             try:
                 await m.timeout(until, reason=reason)
                 done += 1
-            except Exception:
+            except discord.Forbidden:
+                logger.warning("Cannot mute %s: missing permissions", m.id)
+                failed += 1
+            except discord.HTTPException as e:
+                logger.error("Failed to mute %s: %s", m.id, e)
                 failed += 1
             await asyncio.sleep(0.5)
         result_embed = make_embed(
@@ -2014,6 +2468,9 @@ class Moderation(commands.Cog):
     async def massunban(self, ctx, *user_ids: int):
         if not user_ids:
             return await self.send(ctx, error_embed(ctx, "Provide at least one user ID."))
+        if len(user_ids) > self.MAX_MASS_ACTION:
+            return await self.send(ctx, error_embed(ctx, f"Maximum {self.MAX_MASS_ACTION} targets allowed."))
+
         msg = await self.send(ctx, make_embed(ctx, f"{EMOJI_COOLDOWN} Mass Unban", f"Processing {len(user_ids)} IDs…", WARN_COLOR))
         done = failed = not_found = 0
         for uid in user_ids:
@@ -2022,7 +2479,11 @@ class Moderation(commands.Cog):
                 done += 1
             except discord.NotFound:
                 not_found += 1
-            except Exception:
+            except discord.Forbidden:
+                logger.warning("Cannot unban %s: missing permissions", uid)
+                failed += 1
+            except discord.HTTPException as e:
+                logger.error("Failed to unban %s: %s", uid, e)
                 failed += 1
             await asyncio.sleep(0.5)
         result_embed = make_embed(
@@ -2037,9 +2498,9 @@ class Moderation(commands.Cog):
         else:
             await self.send(ctx, result_embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  MASS ROLE
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="massrole")
     @require("admin")
     async def massrole(self, ctx, action: str, role: discord.Role, members: commands.Greedy[discord.Member]):
@@ -2048,6 +2509,8 @@ class Moderation(commands.Cog):
             return await self.send(ctx, error_embed(ctx, "Action must be `add` or `remove`."))
         if not members:
             return await self.send(ctx, error_embed(ctx, "Mention at least one member."))
+        if len(members) > self.MAX_MASS_ACTION:
+            return await self.send(ctx, error_embed(ctx, f"Maximum {self.MAX_MASS_ACTION} targets allowed."))
         msg = await self.send(ctx, make_embed(
             ctx, f"{EMOJI_COOLDOWN} Mass Role", f"{'Adding' if action == 'add' else 'Removing'} role from {len(members)} members…", WARN_COLOR
         ))
@@ -2059,7 +2522,11 @@ class Moderation(commands.Cog):
                 else:
                     await m.remove_roles(role)
                 done += 1
-            except Exception:
+            except discord.Forbidden:
+                logger.warning("Cannot %s role %s to %s: missing permissions", action, role.id, m.id)
+                failed += 1
+            except discord.HTTPException as e:
+                logger.error("Failed to %s role %s to %s: %s", action, role.id, m.id, e)
                 failed += 1
             await asyncio.sleep(0.3)
         result_embed = make_embed(
@@ -2074,16 +2541,21 @@ class Moderation(commands.Cog):
         else:
             await self.send(ctx, result_embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  TEMPROLE
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="temprole")
     @require("admin")
     async def temprole(self, ctx, member: discord.Member, role: discord.Role, duration: str):
         seconds = parse_time(duration)
         if seconds <= 0:
             return await self.send(ctx, error_embed(ctx, "Invalid duration."))
-        await member.add_roles(role)
+        try:
+            await member.add_roles(role)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack Manage Roles permission."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Failed to add role: {e}"))
         expires = discord.utils.utcnow() + datetime.timedelta(seconds=seconds)
         await self.send(ctx, make_embed(
             ctx, f"{EMOJI_SUCCESS} Temp Role Assigned",
@@ -2100,14 +2572,16 @@ class Moderation(commands.Cog):
             await asyncio.sleep(seconds)
             try:
                 await member.remove_roles(role, reason="Temprole expired")
-            except Exception:
-                pass
+            except discord.Forbidden:
+                logger.warning("Cannot remove expired temp role %s from %s", role.id, member.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to remove expired temp role %s from %s: %s", role.id, member.id, e)
 
         self.bot.loop.create_task(_remove())
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  INFO COMMANDS
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(aliases=["ui", "whois"])
     async def userinfo(self, ctx, member: discord.Member = None):
         member = member or ctx.author
@@ -2240,9 +2714,9 @@ class Moderation(commands.Cog):
         embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await self.send(ctx, embed)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  POLL
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="poll")
     @require("moderator")
     async def poll(self, ctx, *, question: str):
@@ -2253,37 +2727,48 @@ class Moderation(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
         embed.set_footer(text=f"Poll by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-        msg = await ctx.send(embed=embed)
-        await msg.add_reaction(EMOJI_SUCCESS)
-        await msg.add_reaction(EMOJI_WRONG)
+        try:
+            msg = await ctx.send(embed=embed)
+            await msg.add_reaction(EMOJI_SUCCESS)
+            await msg.add_reaction(EMOJI_WRONG)
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I cannot send messages or add reactions here."))
+        except discord.HTTPException as e:
+            return await self.send(ctx, error_embed(ctx, f"Poll failed: {e}"))
         try:
             await ctx.message.delete()
         except Exception:
             pass
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  NUKE CHANNEL
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="nuke")
     @commands.is_owner()
     async def nuke(self, ctx, channel: discord.TextChannel = None):
         chan = channel or ctx.channel
         pos = chan.position
-        new = await chan.clone(reason=f"Nuke by {ctx.author}")
-        await new.edit(position=pos)
-        await chan.delete()
-        await new.send(
-            embed=make_embed(
-                ctx,
-                f"{EMOJI_BOOM} Channel Nuked",
-                f"This channel was nuked by {ctx.author.mention}.",
-                LOSS_COLOR
+        try:
+            new = await chan.clone(reason=f"Nuke by {ctx.author}")
+            await new.edit(position=pos)
+            await chan.delete()
+            await new.send(
+                embed=make_embed(
+                    ctx,
+                    f"{EMOJI_BOOM} Channel Nuked",
+                    f"This channel was nuked by {ctx.author.mention}.",
+                    LOSS_COLOR
+                )
             )
-        )
+        except discord.Forbidden:
+            return await self.send(ctx, error_embed(ctx, "I lack permissions to nuke this channel."))
+        except discord.HTTPException as e:
+            logger.error("Nuke failed: %s", e)
+            return await self.send(ctx, error_embed(ctx, f"Nuke failed: {e}"))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  EMOJI MANAGEMENT
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     def _build_emoji_list_embed(self, ctx, emojis, page_num: int, total_pages: int) -> discord.Embed:
         desc = "\n".join(f"{e} `:{e.name}:`" for e in emojis)
         embed = make_embed(ctx, f"{EMOJI_FIRE_ANIMATED} Server Emojis", desc, MAIN_COLOR)
@@ -2313,7 +2798,6 @@ class Moderation(commands.Cog):
         await self._emojis_logic(ctx, animated)
 
     @app_commands.command(name="emojis", description="List all custom server emojis")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_emojis(self, interaction: discord.Interaction, animated: Optional[str] = None):
         await self._emojis_logic(interaction, animated)
 
@@ -2335,7 +2819,6 @@ class Moderation(commands.Cog):
         await self._emojiinfo_logic(ctx, emoji)
 
     @app_commands.command(name="emojiinfo", description="Show info about a custom emoji")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_emojiinfo(self, interaction: discord.Interaction, emoji: str):
         obj = await self._parse_emoji(interaction.guild, emoji)
         if not obj:
@@ -2416,7 +2899,6 @@ class Moderation(commands.Cog):
         await self._steal_logic(ctx, name)
 
     @app_commands.command(name="steal", description="Steal an emoji (reply, attach, or URL)")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_steal(self, interaction: discord.Interaction, name: str = None, image_url: str = None):
         await self._steal_logic(interaction, name, image_url)
 
@@ -2484,7 +2966,6 @@ class Moderation(commands.Cog):
         await self._masssteal_logic(ctx)
 
     @app_commands.command(name="masssteal", description="Steal every custom emoji from a replied message")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_masssteal(self, interaction: discord.Interaction):
         await self._masssteal_logic(interaction)
 
@@ -2504,7 +2985,6 @@ class Moderation(commands.Cog):
         await self._renameemoji_logic(ctx, emoji, new_name)
 
     @app_commands.command(name="renameemoji", description="Rename a custom emoji")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_renameemoji(self, interaction: discord.Interaction, emoji: str, new_name: str):
         obj = await self._parse_emoji(interaction.guild, emoji)
         if not obj:
@@ -2536,7 +3016,6 @@ class Moderation(commands.Cog):
         await self._changeemoji_logic(ctx, emoji, image_url)
 
     @app_commands.command(name="changeemoji", description="Change the image of a custom emoji")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_changeemoji(self, interaction: discord.Interaction, emoji: str, image_url: str):
         obj = await self._parse_emoji(interaction.guild, emoji)
         if not obj:
@@ -2559,7 +3038,6 @@ class Moderation(commands.Cog):
         await self._deleteemoji_logic(ctx, emoji)
 
     @app_commands.command(name="deleteemoji", description="Delete a custom emoji")
-    @app_commands.default_permissions(manage_emojis=True)
     async def slash_deleteemoji(self, interaction: discord.Interaction, emoji: str):
         obj = await self._parse_emoji(interaction.guild, emoji)
         if not obj:
@@ -2574,9 +3052,9 @@ class Moderation(commands.Cog):
                 return obj
         return discord.utils.get(guild.emojis, name=emoji_str)
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  LOCKTEXT / RLOCKTEXT
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.command(name="locktext")
     @require("admin")
     async def locktext(self, ctx, channel: discord.TextChannel = None):
@@ -2599,9 +3077,9 @@ class Moderation(commands.Cog):
             f"{chan.mention} is back to normal.", WIN_COLOR
         ))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  CLOWN
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="clown", invoke_without_command=True)
     @require("admin")
     async def clown_group(self, ctx):
@@ -2614,8 +3092,13 @@ class Moderation(commands.Cog):
     @clown_group.command(name="add")
     @require("admin")
     async def clown_add(self, ctx, member: discord.Member):
-        if not self.can_target(ctx.author, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot clown this user."))
+        try:
+            await self.check_mod_permission(ctx, "admin")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(ctx.author, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
         gid = ctx.guild.id
         if gid in self.clowns and member.id in self.clowns[gid]:
             return await self.send(ctx, error_embed(ctx, f"{member.mention} is already a clown."))
@@ -2629,10 +3112,7 @@ class Moderation(commands.Cog):
         )
         role = ctx.guild.get_role(self.clown_role_id)
         if not role:
-            try:
-                role = await ctx.guild.create_role(name="Clown", reason="Clown system")
-            except discord.Forbidden:
-                return await self.send(ctx, error_embed(ctx, "Missing **Manage Roles** to create clown role."))
+            return await self.send(ctx, error_embed(ctx, "Clown role is not configured."))
         try:
             await member.add_roles(role, reason="Clown mode")
         except discord.Forbidden:
@@ -2665,9 +3145,9 @@ class Moderation(commands.Cog):
             pass
         await self.send(ctx, success_embed(ctx, f"{member.mention} is no longer a clown. Nickname restored."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  FORCENICK
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     @commands.group(name="forcenick", invoke_without_command=True)
     @require("admin")
     async def forcenick_group(self, ctx):
@@ -2682,8 +3162,13 @@ class Moderation(commands.Cog):
     async def forcenick_add(self, ctx, member: discord.Member, *, nick: str):
         if len(nick) > 32:
             return await self.send(ctx, error_embed(ctx, "Nickname must be ≤ 32 characters."))
-        if not self.can_target(ctx.author, member):
-            return await self.send(ctx, error_embed(ctx, "You cannot force a nickname on this user."))
+        try:
+            await self.check_mod_permission(ctx, "admin")
+        except commands.CheckFailure as e:
+            return await self.send(ctx, error_embed(ctx, str(e)))
+        ok, err = self.can_target(ctx.author, member)
+        if not ok:
+            return await self.send(ctx, error_embed(ctx, err))
         gid = ctx.guild.id
         if gid in self.forcenicks and member.id in self.forcenicks[gid]:
             return await self.send(ctx, error_embed(ctx, f"{member.mention} already has a forced nickname."))
@@ -2722,9 +3207,9 @@ class Moderation(commands.Cog):
             pass
         await self.send(ctx, success_embed(ctx, f"Forcenick removed from {member.mention}. Nickname restored."))
 
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     #  EMOJI LIST PAGINATION VIEW
-    # ══════════════════════════════════════════════════
+    # ---------------------------------------------------------------
     class EmojiListView(discord.ui.View):
         def __init__(self, ctx, pages):
             super().__init__(timeout=120)
@@ -2768,5 +3253,12 @@ class Moderation(commands.Cog):
             await self._update(interaction)
 
 
+# ---------------------------------------------------------------
+#  Setup function
+# ---------------------------------------------------------------
 async def setup(bot):
-    await bot.add_cog(Moderation(bot))
+    cog = Moderation(bot)
+    await cog._create_tables_if_not_exists()
+    await cog._load_data_files()
+    await bot.add_cog(cog)
+    logger.info("Moderation cog loaded with corrected permissions and database scoping.")

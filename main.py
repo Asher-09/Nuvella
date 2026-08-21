@@ -40,8 +40,9 @@ def load_bot_config():
             with open("config.json", "r") as f:
                 file_config = json.load(f)
                 config.update(file_config)
-        except Exception:
-            pass
+        except Exception as e:
+            console.print_exception(show_locals=True)
+            console.print("[yellow]Warning: Failed to load config.json, using defaults/environment variables.[/yellow]")
 
     if os.getenv("PREFIX"):
         config["prefix"] = os.getenv("PREFIX")
@@ -79,8 +80,8 @@ def load_bot_config():
             if key in roles:
                 try:
                     staff_ids.append(int(roles[key]))
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    console.print(f"[yellow]Invalid role ID for '{key}': {roles[key]} (skipped)[/yellow]")
         config["staff_role_ids"] = staff_ids
 
     return config
@@ -150,7 +151,9 @@ def is_staff(member: discord.Member) -> bool:
     try:
         with open(staff_file) as handle:
             staff_data = json.load(handle)
-    except Exception:
+    except Exception as e:
+        console.print_exception(show_locals=True)
+        console.print("[red]Failed to read data/staff.json[/red]")
         return False
 
     uid = str(member.id)
@@ -182,7 +185,9 @@ def load_np_users():
         with open(path, "r") as f:
             data = json.load(f)
         return {int(uid) for uid in data.get("users", [])}
-    except Exception:
+    except Exception as e:
+        console.print_exception(show_locals=True)
+        console.print("[red]Failed to load np_users.json, returning empty set.[/red]")
         return set()
 
 
@@ -195,7 +200,9 @@ def save_np_users(users_set):
         with open(path, "w") as f:
             json.dump({"users": sorted(list(users_set))}, f, indent=2)
         return True
-    except Exception:
+    except Exception as e:
+        console.print_exception(show_locals=True)
+        console.print("[red]Failed to save np_users.json[/red]")
         return False
 
 
@@ -407,16 +414,18 @@ class Nuvella(commands.Bot):
         if ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
             try:
                 await message.delete()
-            except Exception:
-                pass
+            except Exception as e:
+                console.print_exception(show_locals=True)
+                console.print("[red]Failed to delete message in wrong channel.[/red]")
             if ALLOWED_CHANNEL_ID and message.author.id not in _channel_warned:
                 _channel_warned.add(message.author.id)
                 try:
                     embed = error_embed(message, "Wrong Channel",
                                         f"Commands can only be used in <#{ALLOWED_CHANNEL_ID}>.")
                     await message.channel.send(embed=embed, delete_after=10)
-                except Exception:
-                    pass
+                except Exception as e:
+                    console.print_exception(show_locals=True)
+                    console.print("[red]Failed to send channel warning.[/red]")
             return
 
         await self.process_commands(message)
