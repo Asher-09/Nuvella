@@ -659,10 +659,10 @@ class Clans(commands.Cog):
         embed.add_field(
             name=f"{CLASH_OF_CLANS_2} CLAN MANAGEMENT",
             value=(
-                f"`{prefix}clan create <name>` – Create a clan for 5,000,000 Moon Dust \n"
+                f"`{prefix}clan create <name>` – Create a clan\n"
                 f"`{prefix}clan delete` – Delete your owned clan\n"
                 f"`{prefix}clan leave` – Leave your current clan\n"
-                f"`{prefix}clan rename <name>` – Rename clan for 50,000 Moon Dust \n"
+                f"`{prefix}clan rename <name>` – Rename clan for\n"
                 f"`{prefix}clan set <public/private>` – Toggle visibility"
             ),
             inline=False
@@ -697,11 +697,10 @@ class Clans(commands.Cog):
         embed.add_field(
             name=f"{GREEN_SPARKLING_STAR} PROGRESSION & REWARDS",
             value=(
-                f"`{prefix}clan deposit <amount>` – Deposit Moon Dust into clan bank (non-withdrawable)\n"
+                f"`{prefix}clan deposit <amount>` – Deposit Moon Dust into clan bank\n"
                 f"`{prefix}clan bank` – View total deposited Moon Dust\n"
-                f"`{prefix}clan weekly` – Claim weekly bonus (**scales with level, max 1M at lvl 100**)\n\n"
-                f"**Auto-Leveling:** Clan level rises automatically when total deposits reach:\n"
-                f"Level 2: 100k | Level 3: 250k | Level 4: 450k | ... (+50k required per level)"
+                f"`{prefix}clan weekly` – Claim weekly bonus\n\n"
+    
             ),
             inline=False
         )
@@ -718,25 +717,7 @@ class Clans(commands.Cog):
             inline=False
         )
 
-        embed.add_field(
-            name=f"{EMOJI_ADMIN} ADMIN",
-            value=f"`{prefix}clan admin` – Admin/senior moderator commands",
-            inline=False
-        )
-
-        embed.set_footer(text="💡 Tip: Deposit Moon Dust to increase your clan level automatically!")
-        embed.add_field(
-            name=f"{Q_NOTES} QUICK TIPS",
-            value=(
-                "• Create your clan to become the owner\n"
-                "• Invite friends to grow your clan\n"
-                "• Deposits fill the clan bank and automatically level up your clan\n"
-                "• Claim weekly bonuses for free rewards (bigger at higher levels)!\n"
-                "• Deposits cannot be withdrawn"
-            ),
-            inline=False
-        )
-
+        embed.set_footer(text="💡 Tip: Deposit Moon Dust to increase your clan level!")
         await ctx.send(embed=embed)
 
     # ======================== CREATE ========================
