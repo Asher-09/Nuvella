@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "prefix": "$",
     "owner_id": 1327528116079296594,
     "guild_id": 1535960575341756527,
-    "allowed_channel_id": 1535962338048475267,
+    "allowed_channel_id": 1555408897013977150,
     "staff_role_ids": [],
     "activity": "Watching over Nuvella",
     "activity_url": None,
