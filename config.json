@@ -1,6 +1,6 @@
 {
   "owner_id": 1327528116079296594,
-  "prefix": "$",
+  "prefix": "*",
   "allowed_channel_id": 1555408897013977150,
   "log_channel_id": 1537456851921281115,
   "roles": {
@@ -25,7 +25,7 @@
     "level_1_role_id": 1535961544725368872,
     "supporter_role_id": 1536182809830625292,
     "contributor_role_id": 1535961511275536477,
-    "booster_role_id": 1535961511275536477,
+    "booster_role_id": 1536182809830625292,
     "luck_boost_role_id": 1535961362147057745,
     "top_role_id": 1537456149861900380
   },
@@ -79,10 +79,15 @@
     "command_logging": false
   },
   "allowed_link_role_ids": [
-    111111111111111111,
+    1537278301620670536,
     222222222222222222
   ],
   "clown_role_id": 1537464769450348656,
+  "jail_role_id": 1540368486256218283,
+  "jail_category_id": 1557570927183663104,
+  "quarantine_role_id": 1557571060663197839,
+  "quarantine_channel_id": 1557571460132774040,
+  "warn_ban_threshold": 7,
   "antinuke": {
     "enabled": true,
     "message_spam_limit": 7,
