@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 import json
 import math
 import os
@@ -14,20 +15,21 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from utils.emoji import EMOJIS
 load_dotenv()
 
 console = Console()
 
 DEFAULT_CONFIG = {
-    "prefix": "$",
+    "prefix": "*",
     "owner_id": 1327528116079296594,
     "guild_id": 1535960575341756527,
     "allowed_channel_id": 1555408897013977150,
     "staff_role_ids": [],
     "activity": "Watching over Nuvella",
     "activity_url": None,
-    "sync_commands": False,
-    "application_id": 1537342404099571762,
+    "sync_commands": True,
+    "application_id": 1511537834543153163,
 }
 
 
@@ -101,8 +103,7 @@ GUILD_ID = int(config.get("guild_id") or 0) or None
 MAIN_COLOR = 0x6A0DAD
 WIN_COLOR = 0x57F287
 LOSS_COLOR = 0xED4245
-BREAKER = "<:breaker:1537913026643238932>"
-BREAKER_LINE = BREAKER * 10
+BREAKER_LINE = EMOJIS["breaker"] * 10
 
 ALLOWED_CHANNEL_ID = int(config.get("allowed_channel_id") or 0) or None
 STAFF_ROLE_IDS = set(int(role_id) for role_id in config.get("staff_role_ids", []) if role_id)
@@ -221,6 +222,69 @@ def error_embed(ctx, title, desc):
     return embed
 
 
+class NuvellaCommandTree(app_commands.CommandTree):
+    """Application-command checks shared by all registered slash commands."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        async def deny(title: str, description: str) -> bool:
+            embed = error_embed(interaction, title, description)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                else:
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
+
+        if not interaction.guild:
+            return await deny("Server Only", "This command can only be used inside a server.")
+
+        user = interaction.user
+        member = user if isinstance(user, discord.Member) else interaction.guild.get_member(user.id)
+        if member and is_staff(member):
+            return True
+
+        # Match prefix-command channel restrictions for non-staff users.
+        if ALLOWED_CHANNEL_ID and interaction.channel_id != ALLOWED_CHANNEL_ID:
+            return await deny("Wrong Channel", f"Commands can only be used in <#{ALLOWED_CHANNEL_ID}>.")
+
+        now = time.time()
+        attempts = _command_attempts[user.id]
+        attempts.append(now)
+        while attempts and now - attempts[0] > RATE_LIMIT_WINDOW:
+            attempts.popleft()
+
+        if len(attempts) > RATE_LIMIT_MAX_COMMANDS:
+            try:
+                async with self.client.pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO blacklist (user_id, reason) VALUES ($1, $2) "
+                        "ON CONFLICT (user_id) DO NOTHING",
+                        user.id, "Auto-blacklisted for command spam",
+                    )
+                attempts.clear()
+            except Exception as exc:
+                console.print(f"[red]Failed to apply slash-command spam blacklist: {exc}[/red]")
+                return await deny("Unavailable", "The bot could not verify your request. Please try again later.")
+            return await deny("Blacklisted", "You have been blacklisted for spamming commands.")
+
+        try:
+            if await self.client.is_blacklisted(user.id):
+                return await deny("Blacklisted", "You are blacklisted from using the bot.")
+        except Exception as exc:
+            console.print(f"[red]Failed to check slash-command blacklist: {exc}[/red]")
+            return await deny("Unavailable", "The bot could not verify your request. Please try again later.")
+
+        last_used = _cooldowns.get(user.id)
+        if last_used is not None and now - last_used < COOLDOWN_TIME:
+            remaining = max(1, int(COOLDOWN_TIME - (now - last_used)))
+            return await deny("Cooldown", f"Please wait `{remaining}s` before using another command.")
+
+        _cooldowns[user.id] = now
+        return True
+
+
 def build_command_candidates(bot: commands.Bot):
     """Build a list of possible full command names (including aliases) for prefix commands."""
     candidates = set()
@@ -259,13 +323,17 @@ class Nuvella(commands.Bot):
             intents=intents,
             help_command=None,
             case_insensitive=True,
-            application_id=config.get("application_id")
+            application_id=config.get("application_id"),
+            tree_cls=NuvellaCommandTree,
         )
         self.config = config
         self.start_time = datetime.datetime.now(datetime.timezone.utc)
         self.launch_time = time.perf_counter()
         self.http_session = None
         self.pool = None
+        # Compatibility aliases used by older cogs; all point at the same pool.
+        self.db_pool = None
+        self.pg_pool = None
         self.startup_printed = False
         self.synced_commands = 0
 
@@ -273,22 +341,70 @@ class Nuvella(commands.Bot):
         self.owner_id = OWNER_ID
         self.http_session = aiohttp.ClientSession()
 
-        self.pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+        self.pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=20,
+            command_timeout=60,
+            max_inactive_connection_lifetime=300,
+        )
+        self.db_pool = self.pool
+        self.pg_pool = self.pool
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS blacklist (user_id BIGINT PRIMARY KEY, reason TEXT)"
             )
+            # This table is shared by the economy and clan cogs. Keep its shape
+            # consistent regardless of which feature initializes first.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY,
+                    wallet BIGINT NOT NULL DEFAULT 0,
+                    bank BIGINT NOT NULL DEFAULT 0,
+                    xp BIGINT NOT NULL DEFAULT 0
+                )
+            """)
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS xp BIGINT DEFAULT 0")
+            await conn.execute("UPDATE users SET wallet = 0 WHERE wallet IS NULL")
+            await conn.execute("UPDATE users SET bank = 0 WHERE bank IS NULL")
+            await conn.execute("UPDATE users SET xp = 0 WHERE xp IS NULL")
+            await conn.execute("ALTER TABLE users ALTER COLUMN wallet SET DEFAULT 0")
+            await conn.execute("ALTER TABLE users ALTER COLUMN bank SET DEFAULT 0")
+            await conn.execute("ALTER TABLE users ALTER COLUMN xp SET DEFAULT 0")
+            await conn.execute("ALTER TABLE users ALTER COLUMN wallet SET NOT NULL")
+            await conn.execute("ALTER TABLE users ALTER COLUMN bank SET NOT NULL")
+            await conn.execute("ALTER TABLE users ALTER COLUMN xp SET NOT NULL")
 
-        for file in os.listdir("./cogs"):
-            if file.endswith(".py"):
+        for file in sorted(os.listdir("./cogs")):
+            if file.endswith(".py") and not file.startswith("_"):
                 await self.load_extension(f"cogs.{file[:-3]}")
 
         if config.get("sync_commands", False):
+            # Only giveaway.py should publish slash commands. Remove every other
+            # local application command before syncing, and sync globally once
+            # to delete stale commands left over from earlier deployments.
+            for command in list(self.tree.get_commands()):
+                if command.name != "giveaway":
+                    self.tree.remove_command(command.name, type=command.type)
+
+            if self.tree.get_command("giveaway") is None:
+                raise RuntimeError(
+                    "The /giveaway command group was not registered; refusing to sync an empty command tree."
+                )
+
             if GUILD_ID:
+                # Keep the command guild-scoped for immediate availability. Copy
+                # the approved command before clearing the global tree, then sync
+                # an empty global tree to delete stale app-wide registrations.
                 guild = discord.Object(id=GUILD_ID)
+                self.tree.clear_commands(guild=guild)
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
             else:
+                # With no guild configured, intentionally publish only giveaway
+                # globally and remove any older global registrations.
                 synced = await self.tree.sync()
             self.synced_commands = len(synced)
 
@@ -320,9 +436,16 @@ class Nuvella(commands.Bot):
             console.print(Panel(table, title="Nuvella Online", border_style="magenta", expand=False))
 
     async def close(self):
-        if self.http_session:
+        # Let cogs cancel their background tasks and flush pending state while
+        # the shared pool/session are still available.
+        for cog_name in list(self.cogs):
+            try:
+                await self.remove_cog(cog_name)
+            except Exception as exc:
+                console.print(f"[yellow]Failed unloading cog {cog_name}: {exc}[/yellow]")
+        if self.http_session and not self.http_session.closed:
             await self.http_session.close()
-        if self.pool:
+        if self.pool and not self.pool.is_closing():
             await self.pool.close()
         await super().close()
 
@@ -331,58 +454,12 @@ class Nuvella(commands.Bot):
             row = await conn.fetchval("SELECT 1 FROM blacklist WHERE user_id=$1", uid)
             return row is not None
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not interaction.guild:
-            return True
-
-        user = interaction.user
-        member = interaction.guild.get_member(user.id)
-        if member and is_staff(member):
-            return True
-
-        now = time.time()
-        dq = _command_attempts[user.id]
-        dq.append(now)
-
-        while dq and now - dq[0] > RATE_LIMIT_WINDOW:
-            dq.popleft()
-
-        if len(dq) > RATE_LIMIT_MAX_COMMANDS:
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO blacklist (user_id, reason) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-                    user.id, "Auto-blacklisted for command spam"
-                )
-            dq.clear()
-            await interaction.response.send_message(
-                embed=error_embed(interaction, "Blacklisted",
-                                  "You have been blacklisted for spamming commands."),
-                ephemeral=True
-            )
-            return False
-
-        if await self.is_blacklisted(user.id):
-            await interaction.response.send_message(
-                embed=error_embed(interaction, "Error",
-                                  "You are blacklisted from using the bot."),
-                ephemeral=True
-            )
-            return False
-
-        if user.id in _cooldowns and now - _cooldowns[user.id] < COOLDOWN_TIME:
-            remaining = COOLDOWN_TIME - (now - _cooldowns[user.id])
-            await interaction.response.send_message(
-                embed=error_embed(interaction, "Cooldown",
-                                  f"Please wait `{int(remaining)}s` before using another command."),
-                ephemeral=True
-            )
-            return False
-        _cooldowns[user.id] = now
-        return True
-
     async def on_message(self, message):
-        if message.author.bot or not message.guild:
-            await self.process_commands(message)
+        if message.author.bot:
+            return
+        # Prefix commands in this project are server-oriented. Do not dispatch
+        # them from DMs, where many commands legitimately require a guild/member.
+        if not message.guild:
             return
 
         original = message.content
@@ -437,7 +514,7 @@ bot = Nuvella()
 @bot.check
 async def global_prefix_check(ctx):
     if not ctx.guild:
-        return True
+        raise commands.NoPrivateMessage("This bot's prefix commands are only available inside a server.")
 
     if is_staff(ctx.author):
         return True
@@ -477,9 +554,9 @@ async def global_prefix_check(ctx):
 async def amiblacklisted(ctx):
     blacklisted = await bot.is_blacklisted(ctx.author.id)
     if blacklisted:
-        await ctx.send("🔴 You **ARE** blacklisted. (But if you're staff, you're exempt.)")
+        await ctx.send(f"{EMOJIS['red_circle']} You **ARE** blacklisted. (But if you're staff, you're exempt.)")
     else:
-        await ctx.send("🟢 You are **NOT** blacklisted.")
+        await ctx.send(f"{EMOJIS['green_circle']} You are **NOT** blacklisted.")
 
 
 @bot.group(name="np", invoke_without_command=True)
@@ -586,13 +663,10 @@ async def np_remove(ctx, user: discord.User = None):
         await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="shutdown", description="Shut down the bot.")
-async def shutdown_command(interaction: discord.Interaction):
-    if not is_owner(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            embed=error_embed(interaction, "Denied", "Only the bot owner can use this command."),
-            ephemeral=True
-        )
+@bot.command(name="shutdown", hidden=True)
+async def shutdown_command(ctx: commands.Context):
+    if not is_owner(ctx.author, ctx.guild):
+        await ctx.send(embed=error_embed(ctx, "Denied", "Only the bot owner can use this command."))
         return
 
     embed = discord.Embed(
@@ -601,19 +675,16 @@ async def shutdown_command(interaction: discord.Interaction):
         color=MAIN_COLOR,
         timestamp=discord.utils.utcnow()
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    console.print(Panel(f"Shutdown requested by {interaction.user} ({interaction.user.id})", border_style="red", expand=False))
+    await ctx.send(embed=embed)
+    console.print(Panel(f"Shutdown requested by {ctx.author} ({ctx.author.id})", border_style="red", expand=False))
     await bot.close()
-    sys.exit(0)
+    raise SystemExit(0)
 
 
-@bot.tree.command(name="restart", description="Restart the bot.")
-async def restart_command(interaction: discord.Interaction):
-    if not is_owner(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            embed=error_embed(interaction, "Denied", "Only the bot owner can use this command."),
-            ephemeral=True
-        )
+@bot.command(name="restart", hidden=True)
+async def restart_command(ctx: commands.Context):
+    if not is_owner(ctx.author, ctx.guild):
+        await ctx.send(embed=error_embed(ctx, "Denied", "Only the bot owner can use this command."))
         return
 
     embed = discord.Embed(
@@ -622,8 +693,8 @@ async def restart_command(interaction: discord.Interaction):
         color=MAIN_COLOR,
         timestamp=discord.utils.utcnow()
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-    console.print(Panel(f"Restart requested by {interaction.user} ({interaction.user.id})", border_style="yellow", expand=False))
+    await ctx.send(embed=embed)
+    console.print(Panel(f"Restart requested by {ctx.author} ({ctx.author.id})", border_style="yellow", expand=False))
     await bot.close()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
