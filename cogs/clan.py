@@ -10,6 +10,8 @@ import asyncpg
 from typing import Optional, List
 import logging
 
+from utils.emoji import EMOJIS
+from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
 # ------------------------- Setup logger -------------------------
 logger = logging.getLogger(__name__)
 
@@ -48,10 +50,7 @@ ADMIN_SENIOR_MOD_ROLE_IDS = [rid for rid in ADMIN_SENIOR_MOD_ROLE_IDS if rid]
 CLAN_BLACKLIST_ROLE = MASTER_CONFIG.get("clan_blacklist_role")  # single role ID
 BLACKLIST_ROLES = MASTER_CONFIG.get("blacklist_roles", [])       # list of role IDs
 
-# PostgreSQL connection string (from .env only)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable must be set in .env")
+# The primary bot initializes the single shared PostgreSQL pool before loading cogs.
 
 async def log_to_discord(bot, message: str):
     """Send a log message to the configured Discord logging channel."""
@@ -83,39 +82,11 @@ def to_superscript(s: str) -> str:
     return ''.join(SUPERSCRIPT_MAP.get(ch, ch) for ch in s.lower())
 
 # ------------------------- Emoji constants -------------------------
-EMOJI_TICK      = "<a:tick:1537915747454554222>"
-EMOJI_WRONG     = "<:cross:1537915734087303199>"
-EMOJI_FILE      = "<:file:1537913812416729200>"
-EMOJI_SNIPE     = "<:1b_snipe:1537919015715082420>"
-EMOJI_DELETE    = "<:Deleted:1537919221969846413>"
-EMOJI_LOCK      = "<:lock:1537916486532730890>"
-EMOJI_UNLOCK    = "<:unlock:1537916484532183040>"
-EMOJI_WARN      = "<:purple_warning:1537916196601733241>"
-EMOJI_ALERT     = "<a:alert:1537916605298778143>"
-EMOJI_COLOR     = "<:color:1537919527856111686>"
-EMOJI_UP        = "<:chart:1537919996984959046>"
-EMOJI_MOD       = "<:mod:1537920117503955094>"
-EMOJI_OWNER     = "<a:owner:1537913450754473994>"
-EMOJI_ADMIN     = "<:admin:1537920215399006229>"
-EMOJI_MUTE      = "<a:mute:1537920441627185274>"
-COIN_EMOJI      = "<:moon_dust:1537920654349828267>"
-BREAKER         = "<:breaker:1537913026643238932>"
-BREAKER_LINE    = BREAKER * 10
+EMOJI_LOCK = EMOJIS["lock"]
+BREAKER_LINE    = EMOJIS["breaker"] * 10
 
 # Additional emojis used in clan system
-CLASH_OF_CLANS = "<:coc:1537920842867019847>"
-TB_MONEY_BAG = "<:dust_bag:1537921004532277288>"
-SWORD = "<a:sword:1537921132894625943>"
-SEARCH = "<:search:1537921248368132177>"
-CROWN_CROWN = "<:_purple_crown:1537921342354100254>"
-CLASH_OF_CLANS_2 = "<:coc:1537920842867019847>"
-USER_ID = "<:userid:1537914514736025740>"
-STATS = "<a:stats:1537921547774205972>"
-GREEN_SPARKLING_STAR = "<a:aa_star_purple:1537921654435348681>"
-LIGHT_BULB = "<a:light_bulb:1537921770357657620>"
-Q_NOTES = "<:q_notes:1537922139431370854>"
-NEW_MAIL = "<a:mail:1537917503471095919>"
-POINT_EMOJI = GREEN_SPARKLING_STAR   # for clan points display
+POINT_EMOJI = EMOJIS["purple_star"]   # for clan points display
 
 # Role limits
 MAX_COOWNERS = 2
@@ -147,7 +118,7 @@ COSMETIC_UNLOCKS = {
 }
 
 BADGE_OPTIONS = [
-    "<:dragon_sheild:1537922312060276827>", "<:swords:1537922420776767679>", "<:Dragon:1537922944884408453>", "<:_purple_crown:1537921342354100254>", "<a:purple_fire:1537923927106527304>", "<:moon:1537924074703945778>", "<a:Snowflake:1537924373011370034>", "<a:lightning:1537924519178674226>", "<:black_skull:1537924724208967762>", "<:Purple_flower:1537924809722437753>", "<a:Maple_Leaf:1537924913782984714>", "<:GOLDEN_EAGLES:1537925001183891516>"
+    f"{EMOJIS['dragon_shield']}", f"{EMOJIS['swords']}", f"{EMOJIS['dragon']}", f"{EMOJIS['purple_crown']}", f"{EMOJIS['fire']}", f"{EMOJIS['moon']}", f"{EMOJIS['snowflake']}", f"{EMOJIS['lightning']}", f"{EMOJIS['black_skull']}", f"{EMOJIS['purple_flower']}", f"{EMOJIS['maple_leaf']}", f"{EMOJIS['golden_eagles']}"
 ]
 
 # ------------------------- Economy helpers (now using wallet/bank) -------------------------
@@ -231,7 +202,7 @@ async def eco_add_coins(bot, uid: int, amount: int):
             await record_economy_transaction(conn, uid, amount, "add", "economy")
         await log_to_discord(
             bot,
-            f"{COIN_EMOJI} **Balance Change** | User: {uid} | +{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
+            f"{EMOJIS["moon_dust"]} **Balance Change** | User: {uid} | +{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
         )
 
 async def eco_deduct_coins(bot, uid: int, amount: int) -> bool:
@@ -255,23 +226,20 @@ async def eco_deduct_coins(bot, uid: int, amount: int) -> bool:
         if success:
             await log_to_discord(
                 bot,
-                f"{COIN_EMOJI} **Balance Change** | User: {uid} | -{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
+                f"{EMOJIS["moon_dust"]} **Balance Change** | User: {uid} | -{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
             )
         else:
             await log_to_discord(
                 bot,
-                f"{COIN_EMOJI} **Balance Deduction Failed** | User: {uid} | Attempted -{format_coins(amount)} | Wallet: {format_coins(new_wallet)}"
+                f"{EMOJIS["moon_dust"]} **Balance Deduction Failed** | User: {uid} | Attempted -{format_coins(amount)} | Wallet: {format_coins(new_wallet)}"
             )
         return success
 
 # ------------------------- Database init -------------------------
 async def init_db(bot):
-    bot.db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=5,
-        max_size=50,
-        command_timeout=60
-    )
+    if getattr(bot, "pool", None) is None:
+        raise RuntimeError("The shared PostgreSQL pool was not initialized by main.py.")
+    bot.db_pool = bot.pool  # legacy attribute used by this cog; same pool as every other cog
     async with bot.db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS clans (
@@ -332,8 +300,9 @@ async def init_db(bot):
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
-                wallet BIGINT DEFAULT 1000,
-                bank BIGINT DEFAULT 0
+                wallet BIGINT NOT NULL DEFAULT 0,
+                bank BIGINT NOT NULL DEFAULT 0,
+                xp BIGINT NOT NULL DEFAULT 0
             )
         """)
         await conn.execute("""
@@ -618,22 +587,22 @@ class Clans(commands.Cog):
             await self._info(ctx)
         else:
             embed = discord.Embed(
-                title=f"{CLASH_OF_CLANS} Clan System",
+                title=f"{EMOJIS["coc"]} Clan System",
                 description="Join or create a clan to gain powerful perks and weekly Moon Dust rewards!",
                 color=0x9d4edd
             )
             embed.add_field(
-                name=f"{TB_MONEY_BAG} Weekly Rewards",
+                name=f"{EMOJIS["dust_bag"]} Weekly Rewards",
                 value="Earn Moon Dust every week based on your clan's level. **Max 1,000,000 Moon Dust at level 100.**",
                 inline=False
             )
             embed.add_field(
-                name=f"{EMOJI_UP} Level Up",
+                name=f"{EMOJIS["chart"]} Level Up",
                 value="Your clan level increases automatically when total deposits reach the required amount. Each level requires +50k more than the previous.",
                 inline=False
             )
             embed.add_field(
-                name=f"{SEARCH} Quick Start",
+                name=f"{EMOJIS["search"]} Quick Start",
                 value=(
                     f"`{ctx.prefix}clan create <name>` – Start your own clan (5M Moon Dust)\n"
                     f"`{ctx.prefix}clan join <name>` – Join a public clan\n"
@@ -650,14 +619,14 @@ class Clans(commands.Cog):
     async def clan_help(self, ctx):
         prefix = ctx.prefix
         embed = discord.Embed(
-            title=f"{CLASH_OF_CLANS} CLAN SYSTEM COMMANDS",
+            title=f"{EMOJIS["coc"]} CLAN SYSTEM COMMANDS",
             color=0x9d4edd,
-            description=f"Master the clan system and dominate the server! {CROWN_CROWN}"
+            description=f"Master the clan system and dominate the server! {EMOJIS["purple_crown"]}"
         )
         embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
 
         embed.add_field(
-            name=f"{CLASH_OF_CLANS_2} CLAN MANAGEMENT",
+            name=f"{EMOJIS["coc"]} CLAN MANAGEMENT",
             value=(
                 f"`{prefix}clan create <name>` – Create a clan\n"
                 f"`{prefix}clan delete` – Delete your owned clan\n"
@@ -669,7 +638,7 @@ class Clans(commands.Cog):
         )
 
         embed.add_field(
-            name=f"{USER_ID} MEMBER MANAGEMENT",
+            name=f"{EMOJIS["user_id"]} MEMBER MANAGEMENT",
             value=(
                 f"`{prefix}clan invite @user` – Invite a member\n"
                 f"`{prefix}clan accept <name>` – Accept an invitation\n"
@@ -683,7 +652,7 @@ class Clans(commands.Cog):
         )
 
         embed.add_field(
-            name=f"{STATS} INFO & VIEWING",
+            name=f"{EMOJIS["stats"]} INFO & VIEWING",
             value=(
                 f"`{prefix}clan info [name]` – View clan information\n"
                 f"`{prefix}clan members [name]` – List clan members\n"
@@ -695,7 +664,7 @@ class Clans(commands.Cog):
         )
 
         embed.add_field(
-            name=f"{GREEN_SPARKLING_STAR} PROGRESSION & REWARDS",
+            name=f"{EMOJIS["purple_star"]} PROGRESSION & REWARDS",
             value=(
                 f"`{prefix}clan deposit <amount>` – Deposit Moon Dust into clan bank\n"
                 f"`{prefix}clan bank` – View total deposited Moon Dust\n"
@@ -706,7 +675,7 @@ class Clans(commands.Cog):
         )
 
         embed.add_field(
-            name=f"{EMOJI_COLOR} CUSTOMIZATION",
+            name=f"{EMOJIS["color"]} CUSTOMIZATION",
             value=(
                 f"`{prefix}clan cosmetics` – See what you can unlock\n"
                 f"`{prefix}clan motto <text>` – Set clan motto (Lvl {COSMETIC_UNLOCKS['motto']}+)\n"
@@ -717,7 +686,7 @@ class Clans(commands.Cog):
             inline=False
         )
 
-        embed.set_footer(text="💡 Tip: Deposit Moon Dust to increase your clan level!")
+        embed.set_footer(text=f"{EMOJIS['light_bulb']} Tip: Deposit Moon Dust to increase your clan level!")
         await ctx.send(embed=embed)
 
     # ======================== CREATE ========================
@@ -730,9 +699,9 @@ class Clans(commands.Cog):
     async def _create(self, ctx, name: str):
         name = name.strip()
         if not name:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Name", "Clan name cannot be empty."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Name", "Clan name cannot be empty."))
         if len(name) > 30:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Name", "Clan name must be 30 characters or fewer."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Name", "Clan name must be 30 characters or fewer."))
 
         try:
             async with self.bot.db_pool.acquire() as conn:
@@ -768,16 +737,16 @@ class Clans(commands.Cog):
                     )
         except InsufficientFunds:
             balance = await eco_get_balance(self.bot, ctx.author.id)
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Insufficient Funds",
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Insufficient Funds",
                 f"Creating a clan costs **5,000,000** Moon Dust. You only have **{format_coins(balance)}** Moon Dust."))
         except ClanNameTaken:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Name Taken", f"`{name}` already exists."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Name Taken", f"`{name}` already exists."))
         except AlreadyInClan:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Already in a Clan",
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Already in a Clan",
                                                    "You must leave or delete your current clan first."))
 
         await self._set_nick(ctx.author, name)
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Clan Created!",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Clan Created!",
                                         f"**{name}** is now yours. Invite members with `{ctx.prefix}clan invite @user`.",
                                         success=True))
 
@@ -796,7 +765,7 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "You don't own a clan."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "You don't own a clan."))
             clan_id, name = row['id'], row['name']
 
         await self._confirm_action(ctx, f"Delete **{name}**? This cannot be undone.",
@@ -828,7 +797,7 @@ class Clans(commands.Cog):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        await ctx.send(embed=make_embed(ctx, EMOJI_DELETE, "Clan Deleted",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Clan Deleted",
                                         "The clan has been deleted.", success=True))
 
     # ======================== LEAVE ========================
@@ -845,7 +814,7 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan", "You aren't in a clan."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", "You aren't in a clan."))
             clan_id, role = row['clan_id'], row['role']
 
             if role == "owner":
@@ -854,7 +823,7 @@ class Clans(commands.Cog):
                     self._owner_leave, clan_id)
             else:
                 await self._remove_member(clan_id, ctx.author)
-                await ctx.send(embed=make_embed(ctx, EMOJI_UNLOCK, "Left Clan",
+                await ctx.send(embed=make_embed(ctx, EMOJIS["unlock"], "Left Clan",
                                                 "You left the clan.", success=True))
 
     async def _owner_leave(self, ctx, clan_id):
@@ -870,11 +839,11 @@ class Clans(commands.Cog):
                     await conn.execute("UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, new_owner)
                     await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", new_owner, clan_id)
                     await self._remove_member_atomic(conn, clan_id, ctx.author.id)
-                    await ctx.send(embed=make_embed(ctx, EMOJI_OWNER, "Ownership Passed",
+                    await ctx.send(embed=make_embed(ctx, EMOJIS["owner"], "Ownership Passed",
                         f"<@{new_owner}> is now the owner.", success=True))
                 else:
                     await self._do_delete_atomic(conn, clan_id)
-                    await ctx.send(embed=make_embed(ctx, EMOJI_DELETE, "Clan Deleted",
+                    await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Clan Deleted",
                                                     "The clan has been deleted.", success=True))
 
         # Restore nickname outside DB
@@ -941,28 +910,30 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row or row['role'] != 'owner':
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner",
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
                                                        "Only the clan owner can invite members."))
             clan_id = row['clan_id']
             clan_name = await conn.fetchval("SELECT name FROM clans WHERE id=$1", clan_id)
 
         view = InviteAcceptView(self.bot, member, ctx, clan_id, ctx.author)
         invite_embed = discord.Embed(
-            title=f"{NEW_MAIL} Clan Invitation",
+            title=f"{EMOJIS["mail"]} Clan Invitation",
             description=f"{ctx.author.mention} invited you to join the clan **{clan_name}** on {ctx.guild.name}!",
             color=0x3498db
         )
         try:
-            await member.send(embed=invite_embed, view=view)
-            await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Invited",
+            prepare_v2_view(view, invite_embed)
+            await member.send(view=view)
+            await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Invited",
                 f"{member.mention} has been invited via DM.", success=True))
         except discord.Forbidden:
             try:
-                await ctx.channel.send(embed=invite_embed, view=view)
-                await ctx.send(embed=make_embed(ctx, EMOJI_WARN, "DM Failed",
+                prepare_v2_view(view, invite_embed)
+                await ctx.channel.send(view=view)
+                await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "DM Failed",
                     f"{member.mention}'s DMs are closed. Invitation sent in this channel instead."))
             except:
-                await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Failed",
+                await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Failed",
                     f"Could not invite {member.mention}."))
 
     # ======================== JOIN ========================
@@ -1019,10 +990,10 @@ class Clans(commands.Cog):
                     clan_name_fetched = await conn.fetchval("SELECT name FROM clans WHERE id=$1", clan_id)
 
         except (NoClan, NotInvited, PrivateClan, ClanFull, AlreadyInClan) as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Error", str(e)))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Error", str(e)))
 
         await self._set_nick(ctx.author, clan_name_fetched)
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Welcome!",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Welcome!",
                                         f"{ctx.author.mention} joined the clan.", success=True))
 
     # ======================== INFO ========================
@@ -1040,7 +1011,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_FILE, "No Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["file"], "No Clan",
                                                            "Specify a clan name or join one first."))
                 clan_id = row['clan_id']
             else:
@@ -1049,7 +1020,7 @@ class Clans(commands.Cog):
                     ctx.guild.id, name
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Found",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Found",
                                                            f"`{name}` doesn't exist."))
                 clan_id = row['id']
 
@@ -1096,19 +1067,19 @@ class Clans(commands.Cog):
                              icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
 
             embed.add_field(
-                name=f"{EMOJI_OWNER} Owner",
+                name=f"{EMOJIS["owner"]} Owner",
                 value="\n".join(roles["owner"]) or "None",
                 inline=True
             )
             if roles["coowner"]:
                 embed.add_field(
-                    name=f"{EMOJI_ADMIN} Co‑Owner",
+                    name=f"{EMOJIS["admin"]} Co‑Owner",
                     value="\n".join(roles["coowner"]),
                     inline=True
                 )
             if roles["elder"]:
                 embed.add_field(
-                    name=f"{EMOJI_MOD} Elder",
+                    name=f"{EMOJIS["mod"]} Elder",
                     value="\n".join(roles["elder"]),
                     inline=True
                 )
@@ -1119,8 +1090,8 @@ class Clans(commands.Cog):
                     inline=False
                 )
 
-            embed.add_field(name=f"{EMOJI_UP} Level", value=f"**{level}**", inline=True)
-            embed.add_field(name="Total Deposits", value=f"{COIN_EMOJI} **{format_coins(total_deposits)}**", inline=True)
+            embed.add_field(name=f"{EMOJIS["chart"]} Level", value=f"**{level}**", inline=True)
+            embed.add_field(name="Total Deposits", value=f"{EMOJIS["moon_dust"]} **{format_coins(total_deposits)}**", inline=True)
 
             if level < MAX_LEVEL:
                 next_level = level + 1
@@ -1168,7 +1139,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan",
                                                            "Specify a clan name or join one first."))
                 clan_id = row['clan_id']
             else:
@@ -1177,7 +1148,7 @@ class Clans(commands.Cog):
                     ctx.guild.id, name
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Found",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Found",
                                                            f"No clan `{name}`."))
                 clan_id = row['id']
             cname = await conn.fetchval("SELECT name FROM clans WHERE id=$1", clan_id)
@@ -1192,13 +1163,13 @@ class Clans(commands.Cog):
                 mention = member.mention if member else f"<@{uid}>"
                 roles[role].append(mention)
 
-        embed = discord.Embed(title=f"{EMOJI_SNIPE} {cname} Members", color=0x3498db)
+        embed = discord.Embed(title=f"{EMOJIS["snipe"]} {cname} Members", color=0x3498db)
         if roles["owner"]:
-            embed.add_field(name=f"{EMOJI_OWNER} Owner", value="\n".join(roles["owner"]), inline=True)
+            embed.add_field(name=f"{EMOJIS["owner"]} Owner", value="\n".join(roles["owner"]), inline=True)
         if roles["coowner"]:
-            embed.add_field(name=f"{EMOJI_ADMIN} Co‑Owner", value="\n".join(roles["coowner"]), inline=True)
+            embed.add_field(name=f"{EMOJIS["admin"]} Co‑Owner", value="\n".join(roles["coowner"]), inline=True)
         if roles["elder"]:
-            embed.add_field(name=f"{EMOJI_MOD} Elder", value="\n".join(roles["elder"]), inline=True)
+            embed.add_field(name=f"{EMOJIS["mod"]} Elder", value="\n".join(roles["elder"]), inline=True)
         if roles["member"]:
             embed.add_field(name="Members", value="\n".join(roles["member"]), inline=True)
         embed.add_field(name="\u200b", value=BREAKER_LINE, inline=False)
@@ -1215,7 +1186,7 @@ class Clans(commands.Cog):
     async def _promote(self, ctx, member: discord.Member, role: str):
         role = role.lower().replace("-", "")
         if role not in ("elder", "coowner"):
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Role", "Use `elder` or `coowner`."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Role", "Use `elder` or `coowner`."))
         async with self.bot.db_pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -1223,7 +1194,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row or row['role'] != 'owner':
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
                                                            "Only the clan owner can promote."))
                 clan_id = row['clan_id']
                 target = await conn.fetchrow(
@@ -1231,26 +1202,26 @@ class Clans(commands.Cog):
                     clan_id, member.id
                 )
                 if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not in Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
                                                            f"{member.mention} is not in your clan."))
                 if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Cannot Promote", "They are the owner."))
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Promote", "They are the owner."))
                 if target['role'] == role:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WARN, "Already", "They already hold that role."))
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "Already", "They already hold that role."))
 
                 if role == "coowner":
                     count = await conn.fetchval("SELECT COUNT(*) FROM members WHERE clan_id=$1 AND role='coowner'", clan_id)
                     if count >= MAX_COOWNERS:
-                        return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Limit Reached",
+                        return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Limit Reached",
                                                                f"Maximum {MAX_COOWNERS} co‑owners allowed."))
                 elif role == "elder":
                     count = await conn.fetchval("SELECT COUNT(*) FROM members WHERE clan_id=$1 AND role='elder'", clan_id)
                     if count >= MAX_ELDERS:
-                        return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Limit Reached",
+                        return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Limit Reached",
                                                                f"Maximum {MAX_ELDERS} elders allowed."))
 
                 await conn.execute("UPDATE members SET role=$1 WHERE clan_id=$2 AND user_id=$3", role, clan_id, member.id)
-        await ctx.send(embed=make_embed(ctx, EMOJI_UP, "Promoted",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["chart"], "Promoted",
                                         f"{member.mention} is now **{role}**.", success=True))
 
     # ======================== DEMOTE ========================
@@ -1269,7 +1240,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row or row['role'] != 'owner':
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
                                                            "Only the owner can demote."))
                 clan_id = row['clan_id']
                 target = await conn.fetchrow(
@@ -1277,16 +1248,16 @@ class Clans(commands.Cog):
                     clan_id, member.id
                 )
                 if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not in Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
                                                            f"{member.mention} is not in your clan."))
                 if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Cannot Demote", "They are the owner."))
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Demote", "They are the owner."))
                 if target['role'] == "member":
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WARN, "Already",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "Already",
                                                            "They are already a regular member."))
 
                 await conn.execute("UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
-        await ctx.send(embed=make_embed(ctx, EMOJI_DELETE, "Demoted",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Demoted",
                                         f"{member.mention} is now a member.", success=True))
 
     # ======================== TRANSFER ========================
@@ -1304,7 +1275,7 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "You don't own a clan."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "You don't own a clan."))
             clan_id = row['clan_id']
 
         await self._confirm_action(ctx,
@@ -1317,7 +1288,7 @@ class Clans(commands.Cog):
                 await conn.execute("UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
                 await conn.execute("UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
                 await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", member.id, clan_id)
-        await ctx.send(embed=make_embed(ctx, EMOJI_OWNER, "Ownership Transferred",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["owner"], "Ownership Transferred",
                                         f"{member.mention} is now the owner.", success=True))
 
     # ======================== KICK ========================
@@ -1336,21 +1307,21 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "You don't own a clan."))
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "You don't own a clan."))
                 clan_id = row['clan_id']
                 target = await conn.fetchrow(
                     "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE", clan_id, member.id
                 )
                 if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not in Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
                                                            "That member is not in your clan."))
                 if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Cannot Kick",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Kick",
                                                            "You can't kick yourself."))
                 await self._remove_member_atomic(conn, clan_id, member.id)
 
         await self._remove_member(clan_id, member)
-        await ctx.send(embed=make_embed(ctx, EMOJI_DELETE, "Kicked",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Kicked",
                                         f"{member.mention} has been kicked from the clan.", success=True))
 
     # ======================== LOGO / BANNER ========================
@@ -1373,7 +1344,7 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan", "You aren't in a clan."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", "You aren't in a clan."))
             clan_id, role = row['clan_id'], row['role']
 
             col = "logo_url" if media_type == "logo" else "banner_url"
@@ -1381,18 +1352,18 @@ class Clans(commands.Cog):
             if url is None and not (hasattr(ctx, 'message') and ctx.message and ctx.message.attachments):
                 current = await conn.fetchval(f"SELECT {col} FROM clans WHERE id=$1", clan_id)
                 if current:
-                    embed = discord.Embed(title=f"{EMOJI_SNIPE} Clan {media_type.title()}", color=0x3498db)
+                    embed = discord.Embed(title=f"{EMOJIS["snipe"]} Clan {media_type.title()}", color=0x3498db)
                     embed.set_image(url=current)
                     embed.set_footer(text=f"Requested by {ctx.author}",
                                      icon_url=ctx.author.display_avatar.url)
                     await ctx.send(embed=embed)
                 else:
-                    await ctx.send(embed=make_embed(ctx, EMOJI_FILE, f"No {media_type.title()}",
+                    await ctx.send(embed=make_embed(ctx, EMOJIS["file"], f"No {media_type.title()}",
                                                     f"This clan has no {media_type} set. Use a URL or attach an image."))
                 return
 
             if role != "owner":
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner",
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
                                                        "Only the clan owner can change the clan media."))
             if url is None and ctx.message and ctx.message.attachments:
                 url = ctx.message.attachments[0].url
@@ -1405,7 +1376,7 @@ class Clans(commands.Cog):
                     return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
                         f"Logos unlock at **Clan Level {COSMETIC_UNLOCKS['logo']}**. Your clan is Level **{level}**."))
                 await conn.execute("UPDATE clans SET logo_url=$1 WHERE id=$2", url, clan_id)
-                await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Logo Updated", "Logo set!", success=True))
+                await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Logo Updated", "Logo set!", success=True))
 
             elif media_type == "banner":
                 is_animated = url.lower().endswith('.gif')
@@ -1417,7 +1388,7 @@ class Clans(commands.Cog):
                         "UPDATE clans SET banner_url=$1, banner_type='animated' WHERE id=$2",
                         url, clan_id
                     )
-                    await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Banner Updated", "Animated banner set!", success=True))
+                    await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Banner Updated", "Animated banner set!", success=True))
                 else:
                     if level < COSMETIC_UNLOCKS["static_banner"]:
                         return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
@@ -1426,7 +1397,7 @@ class Clans(commands.Cog):
                         "UPDATE clans SET banner_url=$1, banner_type='static' WHERE id=$2",
                         url, clan_id
                     )
-                    await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Banner Updated", "Banner set!", success=True))
+                    await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Banner Updated", "Banner set!", success=True))
 
     # ======================== VISIBILITY ========================
     @clan_group.command(name="set")
@@ -1439,16 +1410,16 @@ class Clans(commands.Cog):
     async def _set_visibility(self, ctx, vis: str):
         vis = vis.lower()
         if vis not in ("public", "private"):
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid", "Use `public` or `private`."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid", "Use `public` or `private`."))
         async with self.bot.db_pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE clans SET visibility=$1 WHERE id IN (SELECT clan_id FROM members WHERE user_id=$2 AND guild_id=$3 AND role='owner')",
                 vis, ctx.author.id, ctx.guild.id
             )
             if " 0" in result:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner",
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
                                                        "You don't own a clan."))
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Visibility Updated",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Visibility Updated",
                                         f"Clan is now **{vis}**.", success=True))
 
     # ======================== RENAME ========================
@@ -1462,27 +1433,27 @@ class Clans(commands.Cog):
     async def _rename(self, ctx, new_name: str):
         new_name = new_name.strip()
         if not new_name:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Name", "Name cannot be empty."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Name", "Name cannot be empty."))
         async with self.bot.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT c.id, c.name FROM clans c JOIN members m ON c.id=m.clan_id WHERE m.user_id=$1 AND m.guild_id=$2 AND m.role='owner'",
                 ctx.author.id, ctx.guild.id
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "You don't own a clan."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "You don't own a clan."))
             clan_id, old_name = row['id'], row['name']
 
         if not await eco_deduct_coins(self.bot, ctx.author.id, 50_000):
             balance = await eco_get_balance(self.bot, ctx.author.id)
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Insufficient Funds",
-                                                   f"Renaming costs {COIN_EMOJI} **50,000** coins. You have {format_coins(balance)}."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Insufficient Funds",
+                                                   f"Renaming costs {EMOJIS["moon_dust"]} **50,000** coins. You have {format_coins(balance)}."))
 
         async with self.bot.db_pool.acquire() as conn:
             try:
                 await conn.execute("UPDATE clans SET name=$1 WHERE id=$2", new_name, clan_id)
             except asyncpg.UniqueViolationError:
                 await eco_add_coins(self.bot, ctx.author.id, 50_000)
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Name Taken", f"`{new_name}` already exists."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Name Taken", f"`{new_name}` already exists."))
 
             members = await conn.fetch(
                 "SELECT user_id, original_nick FROM members WHERE clan_id=$1", clan_id
@@ -1505,7 +1476,7 @@ class Clans(commands.Cog):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Clan Renamed",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Clan Renamed",
                                         f"**{old_name}** is now **{new_name}**.", success=True))
 
     # ======================== DEPOSIT ========================
@@ -1519,10 +1490,10 @@ class Clans(commands.Cog):
         try:
             amount = parse_amount(amount_str)
         except ValueError:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Format",
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Format",
                                                    "Use a number like `1000`, `10k`, `1.5k`, `1m`."))
         if amount <= 0:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Amount", "Must be positive."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Amount", "Must be positive."))
 
         final_level = None
         try:
@@ -1560,14 +1531,14 @@ class Clans(commands.Cog):
                     await record_economy_transaction(conn, ctx.author.id, -amount, "clan_deposit", "deposit", str(clan_id))
                     final_level = await conn.fetchval("SELECT level FROM clans WHERE id=$1", clan_id)
         except NoClan as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan", str(e)))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(e)))
         except InsufficientFunds:
             balance = await eco_get_balance(self.bot, ctx.author.id)
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Insufficient Funds",
-                                                   f"You don't have {COIN_EMOJI} **{format_coins(amount)}** coins. You have {format_coins(balance)}."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Insufficient Funds",
+                                                   f"You don't have {EMOJIS["moon_dust"]} **{format_coins(amount)}** coins. You have {format_coins(balance)}."))
 
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Deposit Successful",
-                                        f"Deposited {COIN_EMOJI} **{format_coins(amount)}** into your clan bank.\n"
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Deposit Successful",
+                                        f"Deposited {EMOJIS["moon_dust"]} **{format_coins(amount)}** into your clan bank.\n"
                                         f"Current clan level: **{final_level}**",
                                         success=True))
 
@@ -1586,7 +1557,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan",
                                                            "Specify a clan name or join one first."))
                 clan_id = row['clan_id']
             else:
@@ -1595,7 +1566,7 @@ class Clans(commands.Cog):
                     ctx.guild.id, name
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Found",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Found",
                                                            f"No clan `{name}`."))
                 clan_id = row['id']
             row = await conn.fetchrow(
@@ -1603,8 +1574,8 @@ class Clans(commands.Cog):
                 clan_id
             )
             cname, total, level = row['name'], row['total_deposits'] or 0, row['level']
-        embed = make_embed(ctx, EMOJI_SNIPE, f"{cname} Bank",
-                           f"Total deposited: {COIN_EMOJI} **{format_coins(total)}**\n"
+        embed = make_embed(ctx, EMOJIS["snipe"], f"{cname} Bank",
+                           f"Total deposited: {EMOJIS["moon_dust"]} **{format_coins(total)}**\n"
                            f"Current level: **{level}**")
         await ctx.send(embed=embed)
 
@@ -1648,12 +1619,12 @@ class Clans(commands.Cog):
                     await conn.execute("UPDATE users SET wallet = wallet + $1 WHERE id=$2", reward, ctx.author.id)
                     await record_economy_transaction(conn, ctx.author.id, reward, "weekly_reward", "weekly", str(clan_id))
         except NoClan as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan", str(e)))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(e)))
         except AlreadyClaimed as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_MUTE, "Already Claimed", str(e)))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["mute"], "Already Claimed", str(e)))
 
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Weekly Bonus",
-                                        f"You received {COIN_EMOJI} **{format_coins(reward)}** from your clan! (Level {level})",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Weekly Bonus",
+                                        f"You received {EMOJIS["moon_dust"]} **{format_coins(reward)}** from your clan! (Level {level})",
                                         success=True))
 
     # ======================== TOP ========================
@@ -1676,8 +1647,8 @@ class Clans(commands.Cog):
                 ctx.guild.id
             )
         if not clans:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WARN, "No Clans", "The server has no clans yet."))
-        embed = discord.Embed(title=f"{EMOJI_UP} Clan Leaderboard", color=0xf1c40f)
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "No Clans", "The server has no clans yet."))
+        embed = discord.Embed(title=f"{EMOJIS["chart"]} Clan Leaderboard", color=0xf1c40f)
         embed.set_author(name=ctx.guild.name,
                          icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
         desc = ""
@@ -1686,7 +1657,7 @@ class Clans(commands.Cog):
             lvl = record['level']
             mem = record['member_count']
             donated = record['total_deposits']
-            desc += f"**{i}.** {name} — Lvl {lvl} | {mem} Members | Deposited: {COIN_EMOJI} {format_coins(donated)}\n"
+            desc += f"**{i}.** {name} — Lvl {lvl} | {mem} Members | Deposited: {EMOJIS["moon_dust"]} {format_coins(donated)}\n"
         embed.description = desc + f"\n{BREAKER_LINE}"
         await ctx.send(embed=embed)
 
@@ -1701,7 +1672,7 @@ class Clans(commands.Cog):
             except:
                 pass
             return
-        await ctx.send(embed=make_embed(ctx, EMOJI_ADMIN, "Clan Admin Commands",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["admin"], "Clan Admin Commands",
             "`clan admin delete <name>` – Delete a clan\n"
             "`clan admin setlevel <name> <level>` – Set clan level (1-100)\n"
             "`clan admin enable` – Enable clan commands\n"
@@ -1730,7 +1701,7 @@ class Clans(commands.Cog):
                 ctx.guild.id, name
             )
             if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Found", f"No clan `{name}`."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Found", f"No clan `{name}`."))
             await self._do_delete(ctx, row['id'])
 
     @admin_group.command(name="setlevel")
@@ -1747,7 +1718,7 @@ class Clans(commands.Cog):
                 "UPDATE clans SET level=$1 WHERE guild_id=$2 AND LOWER(name)=LOWER($3)",
                 level, ctx.guild.id, name
             )
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Level Set",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Level Set",
                                         f"**{name}** is now level **{level}**.", success=True))
 
     @admin_group.command(name="enable")
@@ -1756,7 +1727,7 @@ class Clans(commands.Cog):
     @guild_cooldown()
     async def enable_cmd(self, ctx):
         await set_clan_enabled(self.bot, ctx.guild.id, True)
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Clan Commands Enabled",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Clan Commands Enabled",
                                         "Clan commands are now enabled for this server.", success=True))
 
     @admin_group.command(name="disable")
@@ -1765,7 +1736,7 @@ class Clans(commands.Cog):
     @guild_cooldown()
     async def disable_cmd(self, ctx):
         await set_clan_enabled(self.bot, ctx.guild.id, False)
-        await ctx.send(embed=make_embed(ctx, EMOJI_MUTE, "Clan Commands Disabled",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["mute"], "Clan Commands Disabled",
                                         "Clan commands are now disabled for non-admin users.", success=True))
 
     @admin_group.command(name="bypasschannel")
@@ -1774,7 +1745,7 @@ class Clans(commands.Cog):
     @guild_cooldown()
     async def bypass_channel_cmd(self, ctx, user: discord.User, channel: discord.TextChannel):
         await add_bypass_channel(self.bot, ctx.guild.id, user.id, channel.id)
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Bypass Added",
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Bypass Added",
                                         f"{user.mention} can now use clan commands in {channel.mention}.",
                                         success=True))
 
@@ -1793,7 +1764,7 @@ class Clans(commands.Cog):
                     ctx.author.id, ctx.guild.id
                 )
                 if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "No Clan",
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan",
                                                            "Specify a clan name or join one first."))
                 clan = await conn.fetchrow("SELECT * FROM clans WHERE id=$1", row['clan_id'])
             else:
@@ -1802,7 +1773,7 @@ class Clans(commands.Cog):
                     ctx.guild.id, name
                 )
                 if not clan:
-                    return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Found", f"No clan `{name}`."))
+                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Found", f"No clan `{name}`."))
 
         level = clan['level']
         motto = clan.get('clan_motto')
@@ -1825,12 +1796,12 @@ class Clans(commands.Cog):
 
         lines = []
         for item in cosmetics_info:
-            status = f"{EMOJI_TICK} Unlocked" if item["unlocked"] else f"{EMOJI_LOCK} Locked"
+            status = f"{EMOJIS["tick"]} Unlocked" if item["unlocked"] else f"{EMOJI_LOCK} Locked"
             equipped = " *(equipped)*" if item["equipped"] else ""
             lines.append(f"**{item['name']}** — {status} (Lvl {item['level']}){equipped}")
 
         embed = discord.Embed(
-            title=f"{EMOJI_COLOR} {clan['name']} — Cosmetics",
+            title=f"{EMOJIS["color"]} {clan['name']} — Cosmetics",
             description="\n".join(lines),
             color=0x9d4edd
         )
@@ -1846,20 +1817,20 @@ class Clans(commands.Cog):
     async def _motto(self, ctx, motto: str):
         motto = motto.strip()[:60]
         if not motto:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Motto", "Motto must be 1-60 characters."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Motto", "Motto must be 1-60 characters."))
         async with self.bot.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2",
                 ctx.author.id, ctx.guild.id
             )
             if not row or row['role'] != 'owner':
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "Only the clan owner can set the motto."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "Only the clan owner can set the motto."))
             clan = await conn.fetchrow("SELECT level FROM clans WHERE id=$1", row['clan_id'])
             if clan['level'] < COSMETIC_UNLOCKS['motto']:
                 return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
                     f"Clan Motto unlocks at **Level {COSMETIC_UNLOCKS['motto']}**. Your clan is Level **{clan['level']}**."))
             await conn.execute("UPDATE clans SET clan_motto=$1 WHERE id=$2", motto, row['clan_id'])
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Motto Set!", f"Clan motto: *\"{motto}\"*", success=True))
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Motto Set!", f"Clan motto: *\"{motto}\"*", success=True))
 
     @clan_group.command(name="badge")
     @clan_cooldown()
@@ -1874,7 +1845,7 @@ class Clans(commands.Cog):
                 ctx.author.id, ctx.guild.id
             )
             if not row or row['role'] != 'owner':
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "Only the clan owner can set the badge."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "Only the clan owner can set the badge."))
             clan = await conn.fetchrow("SELECT level FROM clans WHERE id=$1", row['clan_id'])
             if clan['level'] < COSMETIC_UNLOCKS['badge']:
                 return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
@@ -1883,11 +1854,12 @@ class Clans(commands.Cog):
 
         view = BadgeView(self, ctx, clan_id)
         embed = discord.Embed(
-            title=f"{EMOJI_COLOR} Choose a Clan Badge",
+            title=f"{EMOJIS["color"]} Choose a Clan Badge",
             description="Select a badge from the dropdown menu below.",
             color=0x9d4edd
         )
-        await ctx.send(embed=embed, view=view)
+        prepare_v2_view(view, embed)
+        await ctx.send(view=view)
 
     @clan_group.command(name="color")
     @clan_cooldown()
@@ -1900,20 +1872,20 @@ class Clans(commands.Cog):
         if not color.startswith('#'):
             color = '#' + color
         if not re.match(r'^#([A-Fa-f0-9]{6})$', color):
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Color", "Please provide a valid HEX color like `#9d4edd`."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Color", "Please provide a valid HEX color like `#9d4edd`."))
         async with self.bot.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2",
                 ctx.author.id, ctx.guild.id
             )
             if not row or row['role'] != 'owner':
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "Only the clan owner can set the embed color."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "Only the clan owner can set the embed color."))
             clan = await conn.fetchrow("SELECT level FROM clans WHERE id=$1", row['clan_id'])
             if clan['level'] < COSMETIC_UNLOCKS['embed_color']:
                 return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
                     f"Custom Embed Color unlocks at **Level {COSMETIC_UNLOCKS['embed_color']}**. Your clan is Level **{clan['level']}**."))
             await conn.execute("UPDATE clans SET embed_color=$1 WHERE id=$2", color, row['clan_id'])
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Color Set!", f"Clan embed color: {color}", success=True))
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Color Set!", f"Clan embed color: {color}", success=True))
 
     @clan_group.command(name="description")
     @clan_cooldown()
@@ -1924,28 +1896,28 @@ class Clans(commands.Cog):
     async def _description(self, ctx, description: str):
         description = description.strip()[:1000]
         if not description:
-            return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Invalid Description", "Description must be 1-1000 characters."))
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Description", "Description must be 1-1000 characters."))
         async with self.bot.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2",
                 ctx.author.id, ctx.guild.id
             )
             if not row or row['role'] != 'owner':
-                return await ctx.send(embed=make_embed(ctx, EMOJI_WRONG, "Not Owner", "Only the clan owner can set the description."))
+                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "Only the clan owner can set the description."))
             clan = await conn.fetchrow("SELECT level FROM clans WHERE id=$1", row['clan_id'])
             if clan['level'] < COSMETIC_UNLOCKS['description']:
                 return await ctx.send(embed=make_embed(ctx, EMOJI_LOCK, "Locked",
                     f"Clan Description unlocks at **Level {COSMETIC_UNLOCKS['description']}**. Your clan is Level **{clan['level']}**."))
             await conn.execute("UPDATE clans SET clan_description=$1 WHERE id=$2", description, row['clan_id'])
-        await ctx.send(embed=make_embed(ctx, EMOJI_TICK, "Description Set!", "Clan description updated.", success=True))
+        await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Description Set!", "Clan description updated.", success=True))
 
     # ======================== Helpers ========================
     async def _confirm_action(self, ctx, prompt, callback, *args):
-        msg = await ctx.send(embed=make_embed(ctx, EMOJI_ALERT, "Confirmation", prompt, color=0xe67e22))
-        await msg.add_reaction(EMOJI_TICK)
+        msg = await ctx.send(embed=make_embed(ctx, EMOJIS["alert"], "Confirmation", prompt, color=0xe67e22))
+        await msg.add_reaction(EMOJIS["tick"])
 
         def check(reaction, user):
-            return (user == ctx.author and str(reaction.emoji) == EMOJI_TICK
+            return (user == ctx.author and str(reaction.emoji) == EMOJIS["tick"]
                     and reaction.message.id == msg.id)
         try:
             await self.bot.wait_for("reaction_add", timeout=30.0, check=check)
@@ -1953,7 +1925,7 @@ class Clans(commands.Cog):
             await callback(ctx, *args)
         except asyncio.TimeoutError:
             await msg.delete()
-            await ctx.send(embed=make_embed(ctx, EMOJI_MUTE, "Cancelled", "Confirmation timed out."))
+            await ctx.send(embed=make_embed(ctx, EMOJIS["mute"], "Cancelled", "Confirmation timed out."))
 
     async def _set_nick(self, member, clan_name):
         suffix = to_superscript(clan_name)
@@ -2034,18 +2006,18 @@ class BadgeDropdown(discord.ui.Select):
         self.clan_id = clan_id
 
         badge_names = {
-            "<:dragon_sheild:1537922312060276827>": "Dragon Shield",
-            "<:swords:1537922420776767679>": "Swords",
-            "<:Dragon:1537922944884408453>": "Dragon",
-            "<:_purple_crown:1537921342354100254>": "Purple Crown",
-            "<a:purple_fire:1537923927106527304>": "Purple Fire",
-            "<:moon:1537924074703945778>": "Moon",
-            "<a:Snowflake:1537924373011370034>": "Snowflake",
-            "<a:lightning:1537924519178674226>": "Lightning",
-            "<:black_skull:1537924724208967762>": "Black Skull",
-            "<:Purple_flower:1537924809722437753>": "Purple Flower",
-            "<a:Maple_Leaf:1537924913782984714>": "Maple Leaf",
-            "<:GOLDEN_EAGLES:1537925001183891516>": "Golden Eagles"
+            f"{EMOJIS['dragon_shield']}": "Dragon Shield",
+            f"{EMOJIS['swords']}": "Swords",
+            f"{EMOJIS['dragon']}": "Dragon",
+            f"{EMOJIS['purple_crown']}": "Purple Crown",
+            f"{EMOJIS['fire']}": "Purple Fire",
+            f"{EMOJIS['moon']}": "Moon",
+            f"{EMOJIS['snowflake']}": "Snowflake",
+            f"{EMOJIS['lightning']}": "Lightning",
+            f"{EMOJIS['black_skull']}": "Black Skull",
+            f"{EMOJIS['purple_flower']}": "Purple Flower",
+            f"{EMOJIS['maple_leaf']}": "Maple Leaf",
+            f"{EMOJIS['golden_eagles']}": "Golden Eagles"
         }
 
         options = []
@@ -2080,18 +2052,20 @@ class BadgeDropdown(discord.ui.Select):
             )
 
         await interaction.response.send_message(
-            embed=make_embed(self.ctx, EMOJI_TICK, "Badge Set!",
+            embed=make_embed(self.ctx, EMOJIS["tick"], "Badge Set!",
                 f"Clan badge set to: {selected_badge}", success=True)
         )
 
 
-class BadgeView(discord.ui.View):
+class BadgeView(ComponentsV2View):
     def __init__(self, cog, ctx, clan_id):
         super().__init__(timeout=60)
-        self.add_item(BadgeDropdown(cog, ctx, clan_id))
+        row = discord.ui.ActionRow()
+        row.add_item(BadgeDropdown(cog, ctx, clan_id))
+        self.add_item(row)
 
 
-class InviteAcceptView(discord.ui.View):
+class InviteAcceptView(ComponentsV2View):
     def __init__(self, bot, invitee: discord.Member, ctx, clan_id, inviter):
         super().__init__(timeout=86400)
         self.bot = bot
@@ -2099,9 +2073,16 @@ class InviteAcceptView(discord.ui.View):
         self.ctx = ctx
         self.clan_id = clan_id
         self.inviter = inviter
+        self.buttons = discord.ui.ActionRow()
+        accept_button = discord.ui.Button(label="Accept", style=discord.ButtonStyle.success, emoji=EMOJIS["tick"])
+        decline_button = discord.ui.Button(label="Decline", style=discord.ButtonStyle.danger, emoji=EMOJIS["cross"])
+        accept_button.callback = self.accept
+        decline_button.callback = self.decline
+        self.buttons.add_item(accept_button)
+        self.buttons.add_item(decline_button)
+        self.add_item(self.buttons)
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, emoji="<a:tick:1501584376540954665>")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def accept(self, interaction: discord.Interaction):
         if interaction.user.id != self.invitee.id:
             return await interaction.response.send_message("This invitation is not for you.", ephemeral=True)
 
@@ -2152,19 +2133,16 @@ class InviteAcceptView(discord.ui.View):
         except discord.Forbidden:
             pass
 
-        await interaction.response.send_message(f"{EMOJI_TICK} You've joined **{clan_name}**!", ephemeral=True)
-        for child in self.children:
-            child.disabled = True
+        await interaction.response.send_message(f"{EMOJIS['tick']} You've joined **{clan_name}**!", ephemeral=True)
+        disable_all_components(self)
         await interaction.message.edit(view=self)
 
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, emoji="<:wrong:1501538221530808464>")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def decline(self, interaction: discord.Interaction):
         if interaction.user.id != self.invitee.id:
             return await interaction.response.send_message("This invitation is not for you.", ephemeral=True)
 
-        await interaction.response.send_message(f"{EMOJI_WRONG} Invitation declined.", ephemeral=True)
-        for child in self.children:
-            child.disabled = True
+        await interaction.response.send_message(f"{EMOJIS['cross']} Invitation declined.", ephemeral=True)
+        disable_all_components(self)
         await interaction.message.edit(view=self)
 
 
@@ -2190,18 +2168,3 @@ async def setup(bot):
     cog = Clans(bot)
     await bot.add_cog(cog)
 
-    @bot.tree.command(name="clan_admin_delete", description="(Admin/Senior Mod) Force delete a clan")
-    @app_commands.describe(name="Clan name")
-    async def slash_admin_delete(interaction: discord.Interaction, name: str):
-        if not await cog._is_admin_or_senior_mod(interaction):
-            return await interaction.response.send_message("You do not have permission.", ephemeral=True)
-        sc = SlashContext(interaction)
-        await cog._admin_delete(sc, name)
-
-    @bot.tree.command(name="clan_admin_setlevel", description="(Admin/Senior Mod) Set clan level")
-    @app_commands.describe(name="Clan name", level="New level")
-    async def slash_admin_setlevel(interaction: discord.Interaction, name: str, level: int):
-        if not await cog._is_admin_or_senior_mod(interaction):
-            return await interaction.response.send_message("You do not have permission.", ephemeral=True)
-        sc = SlashContext(interaction)
-        await cog._admin_setlevel(sc, name, level)
