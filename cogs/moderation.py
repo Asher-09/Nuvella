@@ -42,7 +42,8 @@ except ImportError:
 
 
 def _get_tz(name: str):
-    if USE_ZONEINFO:
+    """Resolve a timezone name using whatever timezone backend is available."""
+    if USE_ZONEINFO and ZoneInfo is not None:
         return ZoneInfo(name)
     import pytz
     return pytz.timezone(name)
@@ -90,7 +91,6 @@ EMOJI_DND      = EMOJIS["dnd"]
 
 
 def _apply_footer(embed: discord.Embed, extra: Optional[str] = None) -> discord.Embed:
-    """Apply the standard bot footer, optionally prefixed with extra info."""
     if extra:
         text = f"{extra} • Nuvella  •"
     else:
@@ -129,8 +129,6 @@ async def _deny_silently(ctx: commands.Context) -> None:
 
 
 class ExitOnlyView(discord.ui.View):
-    """Reusable Exit-only view used by timezone panels."""
-
     def __init__(self, author_id: int, timeout: float = 300) -> None:
         super().__init__(timeout=timeout)
         self.author_id = author_id
@@ -198,13 +196,32 @@ PERM_LEVELS = {
     "bot_owner": 9,
 }
 
-# Event staff (event_manager / trial_event_manager) are ONLY allowed to run
-# these commands. Everything else is denied — they do NOT inherit the normal
-# moderation hierarchy.
+# The `**` role (secondary admin marker for this guild) grants admin-level
+# privileges regardless of config. Can also be supplied via
+# config["roles"]["extra_admin_role_ids"] as a list.
+EXTRA_ADMIN_ROLE_IDS = {1558406451150716978}
+
+# Event staff can ONLY run these commands. Everything else is denied —
+# they do NOT inherit the normal moderation hierarchy.
 EVENT_STAFF_ALLOWED_COMMANDS = {
-    "nickname",
     "warns",
 }
+
+EVENT_STAFF_ROLES = {"event_manager", "trial_event_manager"}
+
+# Config key → internal role key. Used to build live role maps.
+_CONFIG_ROLE_KEYS = (
+    ("founder_role_id", "founder"),
+    ("manager_role_id", "manager"),
+    ("head_admin_role_id", "head_admin"),
+    ("admin_role_id", "admin"),
+    ("bot_manager_role_id", "bot_manager"),
+    ("senior_moderator_role_id", "senior_moderator"),
+    ("moderator_role_id", "moderator"),
+    ("trial_moderator_role_id", "trial_moderator"),
+    ("event_manager_role_id", "event_manager"),
+    ("trial_event_manager_role_id", "trial_event_manager"),
+)
 
 ROLE_TOGGLE_MAP = {
     "mod":      ("moderator",            "moderator_role_id"),
@@ -280,8 +297,14 @@ def fmt_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class SilentBlacklistIgnore(commands.CheckFailure):
-    """Raised internally to silently ignore commands from blacklisted users."""
     pass
 
 
@@ -337,8 +360,6 @@ def require(level: str):
 #  Timezone views / modals
 # ---------------------------------------------------------------
 class TimezoneButtonView(discord.ui.View):
-    """'Set Timezone' button that opens a private modal, plus an Exit button."""
-
     def __init__(self, cog, *, guild_id, author_id, target_id, is_edit, timeout=120):
         super().__init__(timeout=timeout)
         self.cog = cog
@@ -388,8 +409,6 @@ class TimezoneButtonView(discord.ui.View):
 
 
 class TimezoneModal(discord.ui.Modal):
-    """Collects a timezone/city privately — only the person who opened it ever sees it."""
-
     def __init__(self, cog, *, guild_id, target_id, set_by_id, is_edit, view):
         super().__init__(title="Edit Member's Timezone" if is_edit else "Set Your Timezone")
         self.cog = cog
@@ -482,22 +501,14 @@ class TimezoneModal(discord.ui.Modal):
 class Moderation(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        cfg = bot.config
+        cfg = bot.config or {}
         self.owner_id = getattr(bot, "owner_id", None)
 
-        roles_cfg = cfg.get("roles", {})
-        self.staff_role_ids = {
-            "founder":           roles_cfg.get("founder_role_id"),
-            "manager":           roles_cfg.get("manager_role_id"),
-            "head_admin":        roles_cfg.get("head_admin_role_id"),
-            "admin":             roles_cfg.get("admin_role_id"),
-            "bot_manager":       roles_cfg.get("bot_manager_role_id"),
-            "event_manager":     roles_cfg.get("event_manager_role_id"),
-            "senior_moderator":  roles_cfg.get("senior_moderator_role_id"),
-            "moderator":         roles_cfg.get("moderator_role_id"),
-            "trial_event_manager": roles_cfg.get("trial_event_manager_role_id"),
-            "trial_moderator":   roles_cfg.get("trial_moderator_role_id"),
-        }
+        # ---- Role ID caches (populated by _refresh_role_ids) ----
+        self.staff_role_ids: dict[str, Optional[int]] = {}
+        self.extra_admin_role_ids: set[int] = set()
+        self._roles_fingerprint_cache = None
+        self._refresh_role_ids(force=True)
 
         self.allowed_link_role_ids = set(cfg.get("allowed_link_role_ids", []))
         self.log_channel_id = cfg.get("log_channel_id")
@@ -516,11 +527,11 @@ class Moderation(commands.Cog):
         self.forcenicks: dict = {}
         self.phish_domains: list = []
         self.banned_words: list = []
-        self.timezones: dict = {}
         self.modstats: dict = {}
 
-        self.antiphish_enabled = True
-        self.wordfilter_enabled = True
+        # Honour config for auto-mod toggles.
+        self.antiphish_enabled = bool(cfg.get("antiphish_enabled", True))
+        self.wordfilter_enabled = bool(cfg.get("wordfilter_enabled", True))
 
         self.snipe_data = defaultdict(lambda: deque(maxlen=5))
         self.edit_snipe_data = defaultdict(lambda: deque(maxlen=5))
@@ -528,6 +539,96 @@ class Moderation(commands.Cog):
 
         self.db = Database(bot)
         self.pool = self.db.pool
+
+    # ---------------------------------------------------------------
+    #  Live role-ID resolution (source of truth = bot.config)
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _as_int(value) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _roles_fingerprint(self):
+        """Cheap fingerprint of the current roles config. Used to skip rebuilding."""
+        try:
+            cfg = self.bot.config or {}
+            roles_cfg = cfg.get("roles", {}) or {}
+            extras_cfg = roles_cfg.get("extra_admin_role_ids") or cfg.get("extra_admin_role_ids") or []
+        except Exception:
+            return None
+
+        def _hashable(seq):
+            if isinstance(seq, (list, tuple, set)):
+                return tuple(sorted(str(x) for x in seq))
+            return ()
+
+        return (
+            tuple(sorted((k, str(v)) for k, v in roles_cfg.items())),
+            _hashable(extras_cfg),
+        )
+
+    def _refresh_role_ids(self, force: bool = False) -> None:
+        """
+        Reload role-ID mappings from bot.config. Called at __init__ and
+        (fingerprint-cached) from every permission check so config edits
+        don't require a reload.
+        """
+        fp = self._roles_fingerprint()
+        if not force and fp is not None and fp == self._roles_fingerprint_cache and self.staff_role_ids:
+            return
+
+        try:
+            cfg = self.bot.config or {}
+            roles_cfg = cfg.get("roles", {}) or {}
+        except Exception:
+            cfg, roles_cfg = {}, {}
+
+        mapping: dict[str, Optional[int]] = {}
+        for cfg_key, internal_key in _CONFIG_ROLE_KEYS:
+            mapping[internal_key] = self._as_int(roles_cfg.get(cfg_key))
+
+        # Some setups nest the *_role_id keys at the top level too.
+        for cfg_key, internal_key in _CONFIG_ROLE_KEYS:
+            if mapping.get(internal_key) is None:
+                mapping[internal_key] = self._as_int(cfg.get(cfg_key))
+
+        self.staff_role_ids = mapping
+
+        extras = set(EXTRA_ADMIN_ROLE_IDS)
+        extra_cfg = roles_cfg.get("extra_admin_role_ids") or cfg.get("extra_admin_role_ids") or []
+        if isinstance(extra_cfg, (list, tuple, set)):
+            for v in extra_cfg:
+                iv = self._as_int(v)
+                if iv is not None:
+                    extras.add(iv)
+        self.extra_admin_role_ids = extras
+
+        self._roles_fingerprint_cache = fp
+
+    def _role_id_to_key_and_level(self) -> dict[int, tuple[str, int]]:
+        """Build {role_id: (internal_key, level)} from live config."""
+        self._refresh_role_ids()
+
+        out: dict[int, tuple[str, int]] = {}
+        for key, rid in self.staff_role_ids.items():
+            if rid is None:
+                continue
+            lv = PERM_LEVELS.get(key, 0)
+            prev = out.get(rid)
+            if prev is None or lv > prev[1]:
+                out[rid] = (key, lv)
+
+        admin_lv = PERM_LEVELS["admin"]
+        for rid in self.extra_admin_role_ids:
+            prev = out.get(rid)
+            if prev is None or admin_lv > prev[1]:
+                out[rid] = ("admin", admin_lv)
+
+        return out
 
     # ---------------------------------------------------------------
     #  Reaction helpers
@@ -578,8 +679,6 @@ class Moderation(commands.Cog):
         except Exception:
             pass
 
-        # Silently swallow commands issued by blacklisted users:
-        # no reply, no error message, no log entry — only a tick/cross reaction.
         author = ctx.author if isinstance(ctx, commands.Context) else getattr(ctx, "user", None)
         if author is not None and author.id in self.blacklisted_users:
             try:
@@ -830,17 +929,20 @@ class Moderation(commands.Cog):
         self.phish_domains = [r["domain"] for r in await self.db.fetch("SELECT domain FROM phish_domains")]
         self.banned_words = [r["word"] for r in await self.db.fetch("SELECT word FROM banned_words")]
 
-        self.timezones = {
-            str(r["user_id"]): r["timezone"]
-            for r in await self.db.fetch("SELECT user_id, timezone FROM user_timezones")
-        }
-
         self.modstats = {}
         for r in await self.db.fetch("SELECT user_id, command, count FROM modstats"):
             self.modstats.setdefault(str(r["user_id"]), {})[r["command"]] = r["count"]
 
+        # Restore persisted log channel (overrides config if present)
+        try:
+            row = await self.db.fetchrow("SELECT channel_id FROM log_config WHERE id = 1")
+            if row and row["channel_id"]:
+                self.log_channel_id = row["channel_id"]
+        except Exception:
+            logger.exception("Failed to restore log channel from DB")
+
     # ---------------------------------------------------------------
-    #  Permissions  (hierarchy-aware)
+    #  Permissions  (fully live-config-driven)
     # ---------------------------------------------------------------
     def _get_actor(self, ctx) -> Optional[discord.Member]:
         if isinstance(ctx, discord.Interaction):
@@ -852,24 +954,62 @@ class Moderation(commands.Cog):
             return None
         return ctx.author
 
-    def _discord_staff_level(self, member: discord.Member) -> int:
-        """
-        Highest internal permission level this member holds based on their
-        *Discord roles*. Used to verify cached levels still match reality.
-        """
+    def _discord_staff_level(self, member) -> int:
+        """Highest level from the member's live Discord roles."""
+        if not isinstance(member, discord.Member):
+            return 0
+        mapping = self._role_id_to_key_and_level()
         highest = 0
-        for lv, rid in self.staff_role_ids.items():
-            if not rid:
+        for role in member.roles:
+            entry = mapping.get(role.id)
+            if entry is None:
                 continue
-            try:
-                if member.get_role(int(rid)):
-                    highest = max(highest, PERM_LEVELS.get(lv, 0))
-            except (TypeError, ValueError):
-                continue
+            lv = entry[1]
+            if lv > highest:
+                highest = lv
         return highest
 
+    def _effective_role_key(self, member) -> str:
+        """
+        Return the internal role key the member *effectively* holds,
+        taking the maximum of:
+          • bot owner / DB owners
+          • cached staff level (staff_cache)
+          • live Discord role level
+        Ties are broken deterministically by alphabetical key order.
+        """
+        if not isinstance(member, discord.Member):
+            return "user"
+        if member.id == self.bot.owner_id or member.id in self.owners:
+            return "bot_owner"
+
+        cache_key = self.get_level(member.id, member.guild.id)
+        best_key = cache_key
+        best_lv = PERM_LEVELS.get(cache_key, 0)
+
+        mapping = self._role_id_to_key_and_level()
+        for role in member.roles:
+            entry = mapping.get(role.id)
+            if entry is None:
+                continue
+            key, lv = entry
+            if lv > best_lv or (lv == best_lv and key < best_key):
+                best_key, best_lv = key, lv
+
+        return best_key
+
+    def _effective_level(self, member) -> int:
+        """Numeric level from cache ∪ live roles ∪ guild admin."""
+        if not isinstance(member, discord.Member):
+            return 0
+        cache_lv = PERM_LEVELS.get(self.get_level(member.id, member.guild.id), 0)
+        discord_lv = self._discord_staff_level(member)
+        eff = max(cache_lv, discord_lv)
+        if member.guild_permissions.administrator:
+            eff = max(eff, PERM_LEVELS["admin"])
+        return eff
+
     def _current_command_name(self, ctx) -> Optional[str]:
-        """Best-effort lookup of the invoked command's primary name."""
         cmd = getattr(ctx, "command", None)
         if cmd is None:
             return None
@@ -880,44 +1020,47 @@ class Moderation(commands.Cog):
         if actor is None:
             raise commands.CheckFailure("This command can only be used by a guild member.")
 
-        internal_level = self.get_level(actor.id, ctx.guild.id)
+        key = self._effective_role_key(actor)
 
-        # EVENT STAFF SPECIAL CASE
-        if internal_level in ("event_manager", "trial_event_manager"):
+        if key == "bot_owner":
+            return
+
+        # Event staff are ONLY allowed `warns` — no other command, regardless
+        # of the numeric level of their role. If they also hold a higher
+        # staff role, _effective_role_key() will return that higher key and
+        # this branch won't fire.
+        if key in EVENT_STAFF_ROLES:
             cmd_name = self._current_command_name(ctx) or ""
             if cmd_name not in EVENT_STAFF_ALLOWED_COMMANDS:
                 raise commands.CheckFailure(
-                    "Event staff can only use `nickname` and `warns`."
+                    "Event staff can only use `warns`."
                 )
             return
 
         required_num = PERM_LEVELS.get(required_level, 0)
-        actor_num = PERM_LEVELS.get(internal_level, 0)
+        actor_num = self._effective_level(actor)
 
         if actor_num < required_num:
+            try:
+                logger.warning(
+                    "check_mod_permission DENY user=%s guild=%s cmd=%s required=%s(%s) "
+                    "actor_effective=%s key=%s cache_key=%s discord_lv=%s extra_admins=%s",
+                    actor.id, getattr(ctx, "guild", None) and ctx.guild.id,
+                    self._current_command_name(ctx),
+                    required_level, required_num,
+                    actor_num, key,
+                    self.get_level(actor.id, ctx.guild.id),
+                    self._discord_staff_level(actor),
+                    sorted(self.extra_admin_role_ids),
+                )
+            except Exception:
+                logger.exception("Failed to emit permission diagnostic")
+
             raise commands.CheckFailure(
                 f"Only **{required_level.replace('_', ' ').title()}**+ can use this command."
             )
 
-        if internal_level == "bot_owner":
-            return
-
-        if self._discord_staff_level(actor) >= required_num:
-            return
-
-        if actor.guild_permissions.administrator:
-            return
-
-        raise commands.CheckFailure(
-            "Your Discord staff role is missing, so this action is blocked."
-        )
-
     def can_target(self, actor, target):
-        """
-        Strict hierarchy check. The actor must be strictly ABOVE the target.
-        Used for every target-based command (nickname, forcenick, warn, mute,
-        kick, ban, jail, clown, ...).
-        """
         guild = actor.guild
         if actor == target:
             return False, "You cannot target yourself."
@@ -926,10 +1069,9 @@ class Moderation(commands.Cog):
         if target.id in self.owners or target.id == self.bot.owner_id:
             return False, "You cannot target a bot owner."
 
-        actor_internal = PERM_LEVELS.get(self.get_level(actor.id, guild.id), 0)
-        target_internal = PERM_LEVELS.get(self.get_level(target.id, guild.id), 0)
+        actor_internal = self._effective_level(actor)
+        target_internal = self._effective_level(target) if isinstance(target, discord.Member) else 0
 
-        # Actor must be strictly above target internally (no peer targeting).
         if target_internal >= actor_internal:
             return False, "Target has an equal or higher internal staff level than you."
 
@@ -940,6 +1082,7 @@ class Moderation(commands.Cog):
         return True, None
 
     def get_level(self, user_id, guild_id=None):
+        """Cache-only lookup. Used as one input to _effective_role_key."""
         if user_id == self.bot.owner_id or user_id in self.owners:
             return "bot_owner"
         order = [
@@ -949,9 +1092,9 @@ class Moderation(commands.Cog):
             ("admin", "admins"),
             ("bot_manager", "bot_managers"),
             ("senior_moderator", "senior_moderators"),
-            ("event_manager", "event_managers"),
             ("moderator", "moderators"),
             ("trial_moderator", "trial_moderators"),
+            ("event_manager", "event_managers"),
             ("trial_event_manager", "trial_event_managers"),
         ]
         if guild_id is not None:
@@ -965,6 +1108,53 @@ class Moderation(commands.Cog):
                     if str(user_id) in staff.get(plur, []):
                         return sing
         return "user"
+
+    # ---------------------------------------------------------------
+    #  Diagnostics
+    # ---------------------------------------------------------------
+    @commands.command(name="debugperms", hidden=True)
+    @commands.guild_only()
+    async def debugperms(self, ctx, member: discord.Member = None):
+        """Owner-only diagnostic for permission resolution."""
+        is_owner = (
+            ctx.author.id == self.bot.owner_id
+            or ctx.author.id in self.owners
+            or ctx.guild.owner_id == ctx.author.id
+        )
+        if not is_owner:
+            return await self.fail(ctx, "Owner only.")
+
+        member = member or ctx.author
+
+        try:
+            raw_roles = self.bot.config.get("roles", {}) if getattr(self.bot, "config", None) else "<no config>"
+        except Exception as e:
+            raw_roles = f"<error reading bot.config: {e}>"
+
+        lines = [
+            f"**Member:** {member.mention} (`{member.id}`)",
+            f"**Top role:** {member.top_role.mention} (pos {member.top_role.position})",
+            f"**Guild admin perms:** `{member.guild_permissions.administrator}`",
+            "",
+            "**Resolved:**",
+            f"• `get_level()` (cache) → `{self.get_level(member.id, ctx.guild.id)}`",
+            f"• `_discord_staff_level()` (live roles) → `{self._discord_staff_level(member)}`",
+            f"• `_effective_role_key()` → `{self._effective_role_key(member)}`",
+            f"• `_effective_level()` → `{self._effective_level(member)}`",
+            "",
+            f"**`self.staff_role_ids`:**\n```\n{self.staff_role_ids}\n```",
+            f"**`self.extra_admin_role_ids`:**\n```\n{sorted(self.extra_admin_role_ids)}\n```",
+            "**Member role IDs:**\n```\n" + "\n".join(str(r.id) for r in member.roles) + "\n```",
+            "",
+            f"**`bot.config['roles']`:**\n```\n{raw_roles}\n```",
+        ]
+
+        embed = discord.Embed(
+            title="Permission Debug",
+            description="\n".join(lines)[:4000],
+            color=GREY_COLOR,
+        )
+        await self.send(ctx, embed)
 
     # ---------------------------------------------------------------
     #  Logging — detailed audit trail
@@ -985,17 +1175,6 @@ class Moderation(commands.Cog):
         moderator: Optional[discord.abc.User] = None,
         is_automod: bool = False,
     ) -> None:
-        """
-        Post a detailed audit-log embed.
-
-        Always includes:
-          - Case ID + UTC timestamp (in footer / field)
-          - Moderator (mention, ID, top role)
-          - Target (mention, ID, top role)
-          - The invoking channel
-          - Optional before/after change block
-          - Optional reason, duration, and free-form extra
-        """
         log_channel = self.get_log_channel()
         if not log_channel:
             return
@@ -1089,9 +1268,7 @@ class Moderation(commands.Cog):
     def is_staff(self, member) -> bool:
         if not isinstance(member, discord.Member):
             return False
-        if member.guild_permissions.administrator:
-            return True
-        return self.get_level(member.id, member.guild.id) != "user"
+        return self._effective_level(member) > 0
 
     @staticmethod
     def _help_embed(title, lines):
@@ -1099,11 +1276,7 @@ class Moderation(commands.Cog):
         _apply_footer(embed)
         return embed
 
-    # ---------------------------------------------------------------
-    #  Timezone audit-log helper
-    # ---------------------------------------------------------------
     async def _log_action(self, guild_id, title, *, actor=None, channel=None, color=None, fields=None, description=None):
-        """Timezone-module compatible audit logger."""
         try:
             guild = self.bot.get_guild(guild_id)
             if guild is None:
@@ -1227,6 +1400,8 @@ class Moderation(commands.Cog):
         return False
 
     async def is_phishing(self, content):
+        if not content:
+            return False
         for word in re.findall(r'https?://[^\s]+|[^\s]+\.[^\s]+', content):
             word = word.rstrip(".,;:!?)]}>\"'")
             host = self._normalize_domain(word)
@@ -1323,7 +1498,7 @@ class Moderation(commands.Cog):
                 logger.error("Anti-phish delete failed: %s", e)
             return
 
-        if self.wordfilter_enabled and self.banned_words and self.contains_banned_word(message.content):
+        if self.wordfilter_enabled and self.banned_words and self.contains_banned_word(message.content or ""):
             try:
                 await message.delete()
                 await message.channel.send(f"{message.author.mention} Your message contained a banned word.", delete_after=5)
@@ -1339,7 +1514,7 @@ class Moderation(commands.Cog):
                 logger.error("Wordfilter delete failed: %s", e)
 
     async def _bypass_filters(self, member):
-        if self.get_level(member.id, member.guild.id) != "user":
+        if self._effective_level(member) > 0:
             return True
         for role in member.roles:
             if role.id in self.allowed_link_role_ids:
@@ -1696,7 +1871,7 @@ class Moderation(commands.Cog):
         await self.send(ctx, make_embed(ctx, f"{EMOJIS['owner']} Bot Owners", "\n".join(lines) or "None", GREY_COLOR))
 
     # ===============================================================
-    #  BLACKLIST  (Senior Mod and higher)
+    #  BLACKLIST
     # ===============================================================
     @commands.group(name="blacklist", aliases=["bl"])
     @require("senior_moderator")
@@ -1894,9 +2069,9 @@ class Moderation(commands.Cog):
             return
 
         try:
-            tzinfo = ZoneInfo(row["timezone"])
+            tzinfo = _get_tz(row["timezone"])
         except Exception:
-            await _safe_delete(ctx.message)
+            await _safe_delete(getattr(ctx, "message", None))
             await self._log_action(
                 ctx.guild.id,
                 f"{EMOJI_CLOCK} Timezone — View Failed (Invalid Stored TZ)",
@@ -2308,8 +2483,25 @@ class Moderation(commands.Cog):
     # ===============================================================
     DEFAULT_PURGE_AMOUNT = 10
 
+    BOT_PREFIX_SYMBOLS = (
+        "!", ".", ",", "$", "?", "-", "+", "~", "=", "%", "^", "&",
+        "*", ">", "/", "#", ":", ";", "|", "<", "@",
+    )
+
+    def _starts_with_bot_prefix(self, content: Optional[str]) -> bool:
+        if not content:
+            return False
+        prefixes = set(self.BOT_PREFIX_SYMBOLS)
+        bp = getattr(self.bot, "command_prefix", None)
+        if isinstance(bp, str):
+            prefixes.add(bp)
+        elif isinstance(bp, (list, tuple)):
+            prefixes.update(p for p in bp if isinstance(p, str))
+        return any(p and content.startswith(p) for p in prefixes)
+
     async def _purge_logic(self, ctx, amount=10, mode="all", user=None, text_filter=None,
                            after_message=None, before_message=None):
+        amount = _safe_int(amount, self.DEFAULT_PURGE_AMOUNT)
         if amount > 500 or amount < 1:
             return await self.fail(ctx, "Amount must be between 1 and 500.")
 
@@ -2327,7 +2519,9 @@ class Moderation(commands.Cog):
             if mode == "user":
                 return bool(user) and msg.author == user
             if mode == "bots":
-                return msg.author.bot
+                if not msg.author.bot:
+                    return False
+                return self._starts_with_bot_prefix(msg.content) or bool(msg.embeds)
             if mode == "embeds":
                 return bool(msg.embeds)
             if mode == "mentions":
@@ -2337,11 +2531,11 @@ class Moderation(commands.Cog):
             if mode == "text":
                 return not (msg.attachments or msg.embeds or msg.mentions)
             if mode == "startswith":
-                return bool(text_filter) and msg.content.lower().startswith(text_filter.lower())
+                return bool(text_filter) and (msg.content or "").lower().startswith(text_filter.lower())
             if mode == "endswith":
-                return bool(text_filter) and msg.content.lower().endswith(text_filter.lower())
+                return bool(text_filter) and (msg.content or "").lower().endswith(text_filter.lower())
             if mode == "contains":
-                return bool(text_filter) and text_filter.lower() in msg.content.lower()
+                return bool(text_filter) and text_filter.lower() in (msg.content or "").lower()
             return True
 
         try:
@@ -2381,16 +2575,19 @@ class Moderation(commands.Cog):
 
     @commands.command(aliases=["clear", "clean", "prune", "cb", "c"])
     @require("trial_moderator")
-    async def purge(self, ctx, mode_or_amount: str = None, amount: int = None, *, text_filter: str = None):
+    async def purge(self, ctx, mode_or_amount: str = None, amount: str = None, *, text_filter: str = None):
         if mode_or_amount is None:
             return await self._purge_logic(ctx, self.DEFAULT_PURGE_AMOUNT, "all")
+
         if mode_or_amount.isdigit():
             return await self._purge_logic(ctx, int(mode_or_amount), "all")
 
         mode = mode_or_amount.lower()
 
         if mode in ("startswith", "endswith", "contains"):
-            combined = " ".join(p for p in [str(amount) if amount is not None else None, text_filter] if p)
+            combined = " ".join(
+                p for p in [str(amount) if amount is not None else None, text_filter] if p
+            )
             remaining, trailing = self._split_trailing_amount(combined)
             parsed = trailing if trailing is not None else self.DEFAULT_PURGE_AMOUNT
             if not remaining:
@@ -2398,7 +2595,9 @@ class Moderation(commands.Cog):
             return await self._purge_logic(ctx, parsed, mode, text_filter=remaining)
 
         if mode == "user":
-            combined = " ".join(p for p in [str(amount) if amount is not None else None, text_filter] if p)
+            combined = " ".join(
+                p for p in [str(amount) if amount is not None else None, text_filter] if p
+            )
             remaining, trailing = self._split_trailing_amount(combined)
             parsed = trailing if trailing is not None else self.DEFAULT_PURGE_AMOUNT
             if not remaining:
@@ -2410,8 +2609,12 @@ class Moderation(commands.Cog):
                 return await self.fail(ctx, "Invalid user.")
             return await self._purge_logic(ctx, parsed, mode, user=user)
 
-        if mode in ("bots", "embeds", "mentions", "attachments", "text", "all"):
-            parsed = amount if amount is not None else self.DEFAULT_PURGE_AMOUNT
+        if mode in ("b", "bot", "bots"):
+            parsed = _safe_int(amount, self.DEFAULT_PURGE_AMOUNT)
+            return await self._purge_logic(ctx, parsed, "bots")
+
+        if mode in ("embeds", "mentions", "attachments", "text", "all"):
+            parsed = _safe_int(amount, self.DEFAULT_PURGE_AMOUNT)
             return await self._purge_logic(ctx, parsed, mode)
 
         return await self._purge_logic(ctx, self.DEFAULT_PURGE_AMOUNT, "all")
@@ -2421,7 +2624,7 @@ class Moderation(commands.Cog):
     async def clearmsg_group(self, ctx, amount: int = 10):
         await self._purge_logic(ctx, amount, "all")
 
-    @clearmsg_group.command(name="bot", aliases=["b"])
+    @clearmsg_group.command(name="bot", aliases=["b", "bots"])
     @require("trial_moderator")
     async def clearmsg_bot(self, ctx, amount: int = 10):
         await self._purge_logic(ctx, amount, "bots")
@@ -2437,7 +2640,7 @@ class Moderation(commands.Cog):
         await self._purge_logic(ctx, amount, "all")
 
     # ===============================================================
-    #  SLOWMODE  (Moderator and higher) — aliases: sm, slowmo, slow
+    #  SLOWMODE
     # ===============================================================
     @commands.command(aliases=["sm", "slowmo", "slow"])
     @require("moderator")
@@ -2460,26 +2663,30 @@ class Moderation(commands.Cog):
         )
 
     # ===============================================================
-    #  LOCK / UNLOCK  (Moderator and higher)
+    #  LOCK / UNLOCK
     # ===============================================================
     LOCK_SNAPSHOT_VERSION = 2
 
     def _get_lock_bypass_role_ids(self, guild):
-        roles_cfg = self.bot.config.get("roles", {})
+        self._refresh_role_ids()
         bypass_ids = set()
 
         for role_name, level in PERM_LEVELS.items():
             if level < PERM_LEVELS["admin"]:
                 continue
-
-            role_id = roles_cfg.get(f"{role_name}_role_id") or self.bot.config.get(f"{role_name}_role_id")
-            if role_id is None:
+            rid = self.staff_role_ids.get(role_name)
+            if rid is None:
                 continue
-
             try:
-                bypass_ids.add(int(role_id))
+                bypass_ids.add(int(rid))
             except (TypeError, ValueError):
-                logger.warning("Invalid %s role ID: %r", role_name, role_id)
+                logger.warning("Invalid %s role ID: %r", role_name, rid)
+
+        for rid in self.extra_admin_role_ids:
+            try:
+                bypass_ids.add(int(rid))
+            except (TypeError, ValueError):
+                continue
 
         return bypass_ids
 
@@ -2788,7 +2995,7 @@ class Moderation(commands.Cog):
         should_punish = False
         new_count = 0
         previous = 0
-        async with self.bot.pool.acquire() as conn:
+        async with self.db.pool.acquire() as conn:
             async with conn.transaction():
                 lock_key = ((ctx.guild.id << 22) ^ member.id) & 0x7FFFFFFFFFFFFFFF
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
@@ -3226,7 +3433,7 @@ class Moderation(commands.Cog):
         )
 
     # ===============================================================
-    #  JAIL  (Moderator and higher only)
+    #  JAIL
     # ===============================================================
     async def _jail(self, ctx, member, reason="No reason"):
         guild = ctx.guild
@@ -3263,6 +3470,15 @@ class Moderation(commands.Cog):
                     overwrites[sr] = discord.PermissionOverwrite(
                         view_channel=True, send_messages=True, read_message_history=True,
                     )
+        for rid in self.extra_admin_role_ids:
+            try:
+                sr = guild.get_role(int(rid))
+            except (TypeError, ValueError):
+                sr = None
+            if sr and sr != jail_role:
+                overwrites[sr] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                )
 
         safe_name = re.sub(r"[^a-z0-9\-]+", "-", member.name.lower()).strip("-") or "user"
         try:
@@ -3528,10 +3744,18 @@ class Moderation(commands.Cog):
     async def _toggle_staff_role(self, ctx, member, key):
         internal_role, config_key = ROLE_TOGGLE_MAP[key]
 
-        role_id = self.bot.config.get("roles", {}).get(config_key) or self.bot.config.get(config_key)
+        self._refresh_role_ids()
+        role_id = self.staff_role_ids.get(internal_role)
+        if not role_id:
+            # Fall back to config direct read
+            role_id = self.bot.config.get("roles", {}).get(config_key) or self.bot.config.get(config_key)
+            try:
+                role_id = int(role_id) if role_id else None
+            except (TypeError, ValueError):
+                role_id = None
         if not role_id:
             return await self.fail(ctx, f"`{config_key}` is not configured in config.json.")
-        discord_role = ctx.guild.get_role(role_id)
+        discord_role = ctx.guild.get_role(int(role_id))
         if discord_role is None:
             return await self.fail(ctx, f"Role `{role_id}` not found in this guild.")
 
@@ -3661,7 +3885,7 @@ class Moderation(commands.Cog):
         role_id = self.bot.config.get("roles", {}).get("developer_role_id") or self.bot.config.get("developer_role_id")
         if not role_id:
             return await self.fail(ctx, "`developer_role_id` is not configured in config.json.")
-        dev_role = ctx.guild.get_role(role_id)
+        dev_role = ctx.guild.get_role(int(role_id))
         if dev_role is None:
             return await self.fail(ctx, f"Role `{role_id}` not found in this guild.")
 
@@ -3689,6 +3913,8 @@ class Moderation(commands.Cog):
     @commands.command(name="staff")
     @require("admin")
     async def staff(self, ctx):
+        self._refresh_role_ids()
+
         embed = make_embed(ctx, "Staff Members", "", GREY_COLOR)
         order = [
             ("Admin", self.staff_role_ids.get("admin")),
@@ -3701,7 +3927,7 @@ class Moderation(commands.Cog):
         for label, role_id in order:
             if not role_id:
                 continue
-            role = ctx.guild.get_role(role_id)
+            role = ctx.guild.get_role(int(role_id))
             if not role:
                 embed.add_field(name=label, value="Role not found", inline=True)
                 continue
@@ -3711,6 +3937,20 @@ class Moderation(commands.Cog):
                 continue
             lines = [m.mention for m in sorted(members, key=lambda m: m.name.lower())]
             embed.add_field(name=label, value="\n".join(lines), inline=True)
+
+        for rid in self.extra_admin_role_ids:
+            try:
+                extra = ctx.guild.get_role(int(rid))
+            except (TypeError, ValueError):
+                extra = None
+            if extra is None:
+                continue
+            members = extra.members
+            value = "None" if not members else "\n".join(
+                m.mention for m in sorted(members, key=lambda m: m.name.lower())
+            )
+            embed.add_field(name=f"Admin ({extra.name})", value=value, inline=True)
+
         await self.send(ctx, embed)
 
     # ===============================================================
@@ -4221,7 +4461,7 @@ class Moderation(commands.Cog):
                 except Exception:
                     pass
         if ref and not direct_url:
-            matches = list(dict.fromkeys(re.findall(r"<(a?):(\w+):(\d+)>", ref.content)))
+            matches = list(dict.fromkeys(re.findall(r"<(a?):(\w+):(\d+)>", ref.content or "")))
             if not matches:
                 return await self.fail(ctx, "No custom emojis found in that message.")
             if len(matches) > 10:
@@ -4285,7 +4525,7 @@ class Moderation(commands.Cog):
                     pass
         if not ref:
             return await self.fail(ctx, "Reply to a message containing custom emojis.")
-        matches = list(dict.fromkeys(re.findall(r"<(a?):(\w+):(\d+)>", ref.content)))
+        matches = list(dict.fromkeys(re.findall(r"<(a?):(\w+):(\d+)>", ref.content or "")))
         if not matches or len(matches) > 20:
             return await self.fail(ctx, "No custom emojis or over 20.")
         if isinstance(ctx, discord.Interaction):
@@ -4442,7 +4682,7 @@ class Moderation(commands.Cog):
                               extra="Plain text messages will now be auto-deleted; only images/links allowed.")
 
     # ===============================================================
-    #  CLOWN (Mods and higher; toggles role + forces nick to "Clown")
+    #  CLOWN
     # ===============================================================
     @commands.command(name="clown")
     @require("moderator")
@@ -4533,7 +4773,7 @@ class Moderation(commands.Cog):
         )
 
     # ===============================================================
-    #  FORCENICK (Mods and higher)
+    #  FORCENICK
     # ===============================================================
     @commands.group(name="forcenick", invoke_without_command=True)
     @require("moderator")
