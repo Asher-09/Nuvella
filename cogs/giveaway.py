@@ -15,7 +15,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# Rich console for error formatting
+from utils.emoji import EMOJIS
+from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
 from rich.console import Console
 import rich
 from rich.panel import Panel
@@ -28,6 +29,7 @@ _SECRET_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+
 def _sanitize(text: str) -> str:
     return _SECRET_PATTERN.sub("[REDACTED]", text)
 
@@ -37,14 +39,17 @@ class GiveawayStatus(str, enum.Enum):
     ENDED = "ended"
     CANCELLED = "cancelled"
 
+
 class MessageRequirementPeriod(str, enum.Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
+
 
 class RoleListType(str, enum.Enum):
     REQUIRED = "required"
     BLACKLIST = "blacklist"
     BYPASS = "bypass"
+
 
 BUTTON_STYLE_MAP = {
     "primary": discord.ButtonStyle.primary,
@@ -54,9 +59,12 @@ BUTTON_STYLE_MAP = {
 }
 
 # ─────────────────────────────────────────────
-# Dark purple theme colour
-DARK_PURPLE = 0x6A0DAD
+# Modern Discord grey theme colour — used for every embed
+GREY_COLOR = 0x2B2D31
+# Default reroll window (hours) when none is provided
+DEFAULT_REROLL_HOURS = 24
 # ─────────────────────────────────────────────
+
 
 @dataclass
 class GiveawaySettings:
@@ -74,9 +82,9 @@ class GiveawaySettings:
     image_url: Optional[str] = None
     gif_url: Optional[str] = None
     video_url: Optional[str] = None
-    color: int = DARK_PURPLE
-    button_style: str = "primary"
-    button_emoji: Optional[str] = "<a:x_confete:1538039846164234250>"
+    color: int = GREY_COLOR
+    button_style: str = "secondary"
+    button_emoji: Optional[str] = f"{EMOJIS['confetti']}"
     button_label: str = "Enter Giveaway"
     required_message_count: int = 0
     required_message_period: str = MessageRequirementPeriod.DAILY.value
@@ -207,63 +215,63 @@ def _format_error(title: str, message: str) -> Panel:
     """Format error for rich console output."""
     return Panel(
         Text(_sanitize(f"{message}"), style="red"),
-        title=f"[bold red]❌ {title}[/bold red]",
-        border_style="red"
+        title=f"[bold red]{EMOJIS['x']} {title}[/bold red]",
+        border_style="red",
     )
 
 
-def _config_get(key: str, default: Any = None) -> Any:
-    """
-    Safely get a value from CONFIG whether it is a dict or an object.
-    """
-    if isinstance(CONFIG, dict):
-        return CONFIG.get(key, default)
-    return getattr(CONFIG, key, default)
+def _config_get(key: str, default: Any = None, config: Any = None) -> Any:
+    """Read configuration from the bot's loaded config without relying on a global."""
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
 
 
-def _get_global_blacklist() -> list[int]:
-    """Helper to get global blacklist from config, always returns a list."""
-    blacklist = _config_get('giveaway_blacklist', None)
-    
-    # Handle single int value
+def _get_global_blacklist(config: Any = None) -> list[int]:
+    """Return configured global giveaway blacklist role IDs as a list."""
+    blacklist = _config_get("giveaway_blacklist", None, config)
     if isinstance(blacklist, int):
         return [blacklist]
-    # Handle list (just in case)
-    elif isinstance(blacklist, list):
-        return [r for r in blacklist if r is not None]
-    else:
-        return []
+    if isinstance(blacklist, (list, tuple, set)):
+        result = []
+        for role_id in blacklist:
+            try:
+                if role_id is not None:
+                    result.append(int(role_id))
+            except (TypeError, ValueError):
+                continue
+        return result
+    return []
 
 
-def _get_all_permission_role_ids() -> set[int]:
+def _get_giveaway_permission_role_ids(config: Any = None) -> set[int]:
     """
-    Collect all role IDs that should have giveaway management permissions.
-    Uses the provided config.json structure and also supports older flat attributes.
+    Collect only the role IDs that are permitted to manage giveaways:
+    event manager, senior moderator, and admin.
+
+    Reads from the ``roles`` section of config.json (and falls back to legacy
+    flat keys). Never includes moderator/trial/level roles.
     """
     ids: set[int] = set()
 
-    # Old flat style attributes
-    for attr in ("dev_role", "admin_role", "sr_event_team_role", "head_staff_role", "sr_org_role_id"):
-        val = _config_get(attr)
+    roles_section = _config_get("roles", {}, config)
+    if isinstance(roles_section, dict):
+        for key in ("admin_role_id", "senior_moderator_role_id", "event_manager_role_id"):
+            val = roles_section.get(key)
+            if isinstance(val, int):
+                ids.add(val)
+            elif isinstance(val, list):
+                ids.update(v for v in val if isinstance(v, int))
+
+    # Legacy flat names
+    for attr in ("admin_role", "sr_event_team_role", "head_staff_role"):
+        val = _config_get(attr, None, config)
         if isinstance(val, int):
             ids.add(val)
         elif isinstance(val, list):
-            ids.update(val)
-
-    # New config.json structure
-    for section in ("roles", "staff_roles"):
-        section_val = _config_get(section)
-        if isinstance(section_val, dict):
-            for val in section_val.values():
-                if isinstance(val, int):
-                    ids.add(val)
-                elif isinstance(val, list):
-                    ids.update(val)
-
-    # also include allowed_link_role_ids just in case
-    allowed_links = _config_get("allowed_link_role_ids")
-    if isinstance(allowed_links, list):
-        ids.update(allowed_links)
+            ids.update(v for v in val if isinstance(v, int))
 
     return ids
 
@@ -289,27 +297,29 @@ class GiveawayRepo:
                 "WHERE table_name='giveaways' AND column_name='sponsor'"
             )
             if not row:
-                await conn.execute('ALTER TABLE giveaways ADD COLUMN sponsor TEXT')
-            
+                await conn.execute("ALTER TABLE giveaways ADD COLUMN sponsor TEXT")
+
             row = await conn.fetchrow(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name='giveaways' AND column_name='reroll_hours'"
             )
             if not row:
-                await conn.execute('ALTER TABLE giveaways ADD COLUMN reroll_hours INTEGER NOT NULL DEFAULT 24')
-            
+                await conn.execute(
+                    "ALTER TABLE giveaways ADD COLUMN reroll_hours INTEGER NOT NULL DEFAULT 24"
+                )
+
             row = await conn.fetchrow(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name='giveaways' AND column_name='use_global_blacklist'"
             )
             if not row:
-                await conn.execute('ALTER TABLE giveaways ADD COLUMN use_global_blacklist BOOLEAN NOT NULL DEFAULT TRUE')
+                await conn.execute(
+                    "ALTER TABLE giveaways ADD COLUMN use_global_blacklist BOOLEAN NOT NULL DEFAULT TRUE"
+                )
 
     async def get_guild_settings(self, guild_id: int) -> Optional[asyncpg.Record]:
         async with self.pool.acquire() as conn:
-            return await conn.fetchrow(
-                "SELECT * FROM guild_settings WHERE guild_id = $1", guild_id
-            )
+            return await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", guild_id)
 
     async def upsert_guild_settings(self, guild_id: int, **kwargs: Any) -> None:
         if not kwargs:
@@ -324,7 +334,6 @@ class GiveawayRepo:
         )
         async with self.pool.acquire() as conn:
             await conn.execute(query, guild_id, *kwargs.values())
-
 
     async def create_giveaway(self, s: GiveawaySettings, end_time: datetime) -> int:
         async with self.pool.acquire() as conn:
@@ -352,7 +361,7 @@ class GiveawayRepo:
                     s.required_message_period, s.required_join_age_days,
                     s.required_invite_count, s.required_level, s.required_booster,
                     s.required_nitro, s.winner_role_id, s.custom_timestamp, end_time,
-                    s.sponsor, s.reroll_hours, s.use_global_blacklist
+                    s.sponsor, s.reroll_hours, s.use_global_blacklist,
                 )
                 giveaway_id = row["id"]
                 await self._insert_role_lists(conn, giveaway_id, s)
@@ -372,7 +381,9 @@ class GiveawayRepo:
                 entries,
             )
 
-    async def set_message_id(self, giveaway_id: int, message_id: int, thread_id: Optional[int] = None) -> None:
+    async def set_message_id(
+        self, giveaway_id: int, message_id: int, thread_id: Optional[int] = None
+    ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE giveaways SET message_id = $2, thread_id = $3 WHERE id = $1",
@@ -421,7 +432,9 @@ class GiveawayRepo:
         async with self.pool.acquire() as conn:
             await conn.execute(query, giveaway_id, *kwargs.values())
 
-    async def replace_role_list(self, giveaway_id: int, list_type: RoleListType, role_ids: Sequence[int]) -> None:
+    async def replace_role_list(
+        self, giveaway_id: int, list_type: RoleListType, role_ids: Sequence[int]
+    ) -> None:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -442,7 +455,6 @@ class GiveawayRepo:
                 "THEN now() ELSE ended_at END WHERE id = $1",
                 giveaway_id, status.value,
             )
-
 
     async def add_entry(self, giveaway_id: int, user_id: int) -> bool:
         async with self.pool.acquire() as conn:
@@ -493,8 +505,9 @@ class GiveawayRepo:
             )
             return [r["user_id"] for r in rows]
 
-
-    async def record_winners(self, giveaway_id: int, user_ids: Sequence[int], is_reroll: bool) -> None:
+    async def record_winners(
+        self, giveaway_id: int, user_ids: Sequence[int], is_reroll: bool
+    ) -> None:
         if not user_ids:
             return
         async with self.pool.acquire() as conn:
@@ -538,7 +551,6 @@ class GiveawayRepo:
                 "ORDER BY won_at DESC LIMIT 50",
                 giveaway_id,
             )
-
 
     async def flush_message_counts(self, deltas: dict[tuple[int, int], int]) -> None:
         if not deltas:
@@ -607,11 +619,17 @@ class GiveawayRepo:
                 "WHERE weekly_reset_at < now() - INTERVAL '7 days'"
             )
 
-
-    async def log(self, guild_id: int, event_type: str, giveaway_id: Optional[int] = None, **data: Any) -> None:
+    async def log(
+        self,
+        guild_id: int,
+        event_type: str,
+        giveaway_id: Optional[int] = None,
+        **data: Any,
+    ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO giveaway_logs (guild_id, giveaway_id, event_type, data) VALUES ($1, $2, $3, $4::jsonb)",
+                "INSERT INTO giveaway_logs (guild_id, giveaway_id, event_type, data) "
+                "VALUES ($1, $2, $3, $4::jsonb)",
                 guild_id, giveaway_id, event_type, json.dumps(data, default=str),
             )
 
@@ -622,12 +640,8 @@ class GiveawayRepo:
                 guild_id, limit,
             )
 
-
     async def clear_all_giveaway_data(self) -> None:
-        """
-        Clear ALL giveaway data except user_message_counts.
-        This preserves message counts while deleting everything else.
-        """
+        """Clear ALL giveaway data except user_message_counts."""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM giveaway_entries")
@@ -653,24 +667,26 @@ def build_giveaway_embed(
     prize = row["prize"]
 
     if status == GiveawayStatus.ACTIVE.value:
-        title = f"<a:x_confete:1538039846164234250> {prize}"
+        title = f"{EMOJIS['confetti']} {prize}"
         desc_lines = [row["description"]] if row["description"] else []
         desc_lines.append("")
         desc_lines.append("Click the button below to enter!")
-        desc_lines.append(f"Ends: <t:{int(ends_at.timestamp())}:R> (<t:{int(ends_at.timestamp())}:f>)")
+        desc_lines.append(
+            f"Ends: <t:{int(ends_at.timestamp())}:R> (<t:{int(ends_at.timestamp())}:f>)"
+        )
     elif status == GiveawayStatus.ENDED.value:
-        title = f"<a:x_confete:1538039846164234250> {prize} — Ended"
+        title = f"{EMOJIS['confetti']} {prize} — Ended"
         desc_lines = [row["description"]] if row["description"] else []
         desc_lines.append("")
         desc_lines.append("This giveaway has ended.")
     else:
-        title = f"<a:x_confete:1538039846164234250> {prize} — Cancelled"
+        title = f"{EMOJIS['confetti']} {prize} — Cancelled"
         desc_lines = ["This giveaway was cancelled."]
 
     embed = discord.Embed(
         title=title,
         description="\n".join(desc_lines),
-        color=discord.Color(row["color"]),
+        color=discord.Color(GREY_COLOR),
     )
 
     host_name = row.get("host_display_name") or f"<@{row['host_id']}>"
@@ -712,7 +728,11 @@ def build_giveaway_embed(
             inline=True,
         )
     if row["required_join_age_days"] > 0:
-        embed.add_field(name="Min. Server Membership", value=f"{row['required_join_age_days']} days", inline=True)
+        embed.add_field(
+            name="Min. Server Membership",
+            value=f"{row['required_join_age_days']} days",
+            inline=True,
+        )
     if row["required_booster"]:
         embed.add_field(name="Requirement", value="Must be a Server Booster", inline=True)
     if row["winner_role_id"]:
@@ -734,10 +754,12 @@ def build_giveaway_embed(
     return embed
 
 
-def build_winner_announcement_embed(row: asyncpg.Record, winners: list[discord.Member], guild: discord.Guild) -> discord.Embed:
+def build_winner_announcement_embed(
+    row: asyncpg.Record, winners: list[discord.Member], guild: discord.Guild
+) -> discord.Embed:
     embed = discord.Embed(
-        title=f"<a:x_confete:1538039846164234250> {row['prize']}",
-        color=discord.Color(row["color"]),
+        title=f"{EMOJIS['confetti']} {row['prize']}",
+        color=discord.Color(GREY_COLOR),
         timestamp=row["ended_at"] or discord.utils.utcnow(),
     )
     host_display = row.get("host_display_name") or f"<@{row['host_id']}>"
@@ -752,44 +774,197 @@ def build_winner_announcement_embed(row: asyncpg.Record, winners: list[discord.M
 
 
 class LeaveView(discord.ui.View):
+    """
+    Ephemeral prompt shown to a user who is already entered.
+
+    Uses a plain (non-V2) ``discord.ui.View`` because it is delivered through an
+    ephemeral followup and does not need an embed container. Sending a
+    Components-V2 view without ``prepare_v2_view`` produces an empty
+    ``components.0.components`` payload that Discord rejects with error 50035.
+    """
+
     def __init__(self, cog: "GiveawayCog", giveaway_id: int):
         super().__init__(timeout=60)
         self.cog = cog
         self.giveaway_id = giveaway_id
 
         button = discord.ui.Button(
-            style=discord.ButtonStyle.danger,
+            style=discord.ButtonStyle.secondary,
             label="Leave Giveaway",
             custom_id=f"giveaway_leave:{giveaway_id}",
         )
         button.callback = self._on_leave_click
+        # Add the button directly — do NOT wrap in ActionRow on a plain View.
         self.add_item(button)
 
     async def _on_leave_click(self, interaction: discord.Interaction) -> None:
         await self.cog.handle_leave_click(interaction, self.giveaway_id)
 
 
-class GiveawayJoinView(discord.ui.View):
-    def __init__(self, cog: "GiveawayCog", giveaway_id: int, style: str, emoji: Optional[str], label: str):
+class GiveawayJoinView(ComponentsV2View):
+    """
+    Persistent V2 view for the giveaway message itself. Sent via
+    ``prepare_v2_view(view, embed)`` so an ActionRow container is valid here.
+    """
+
+    def __init__(
+        self,
+        cog: "GiveawayCog",
+        giveaway_id: int,
+        style: str,
+        emoji: Optional[str],
+        label: str,
+    ):
         super().__init__(timeout=None)
         self.cog = cog
         self.giveaway_id = giveaway_id
 
         button = discord.ui.Button(
-            style=BUTTON_STYLE_MAP.get(style, discord.ButtonStyle.primary),
+            style=BUTTON_STYLE_MAP.get(style, discord.ButtonStyle.secondary),
             label=label,
             emoji=emoji or None,
             custom_id=f"giveaway_join:{giveaway_id}",
         )
         button.callback = self._on_click
-        self.add_item(button)
+        row = discord.ui.ActionRow()
+        row.add_item(button)
+        self.add_item(row)
 
     async def _on_click(self, interaction: discord.Interaction) -> None:
         await self.cog.handle_join_click(interaction, self.giveaway_id)
 
 
+class WinnerConfirmView(discord.ui.View):
+    """
+    DM view presented to a giveaway winner. Uses plain (non-V2) UI components
+    because Components-V2 items (such as ``discord.ui.ActionRow``) cannot be
+    added to a standard ``discord.ui.View`` — Discord rejects the payload with
+    "v2 items cannot be added to this view". Buttons must be added directly.
+    Lifetime is driven by the giveaway's ``reroll_hours``.
+    """
+
+    def __init__(
+        self,
+        cog: "GiveawayCog",
+        row: asyncpg.Record,
+        member: discord.Member,
+        timeout: int,
+    ):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.row = row
+        self.member = member
+        self.message: Optional[discord.Message] = None
+
+        yes_button = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Yes, I'll keep it",
+            custom_id=f"winner_keep:{row['id']}",
+        )
+        yes_button.callback = self._on_yes
+
+        no_button = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="No, reroll it",
+            custom_id=f"winner_reroll:{row['id']}",
+        )
+        no_button.callback = self._on_no
+
+        # Add buttons directly — do NOT wrap in ActionRow on a plain View.
+        self.add_item(yes_button)
+        self.add_item(no_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member.id:
+            try:
+                await interaction.response.send_message(
+                    "This prompt is not for you.", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+            return False
+        return True
+
+    async def _on_yes(self, interaction: discord.Interaction) -> None:
+        row = self.row
+        guild = self.member.guild
+        server_icon_url = guild.icon.url if guild.icon else None
+        server_name = guild.name
+
+        second_embed = discord.Embed(
+            title="Hey there!!",
+            description=(
+                "It seems you'd like to keep the prize.\n\n"
+                f"Please contact the {EMOJIS['mail']} Event Team by opening an event "
+                "ticket for your winning prize.\n\n"
+                "**Objective** — Open a ticket through <#1535992504934072390>"
+            ),
+            color=discord.Color(GREY_COLOR),
+        )
+        second_embed.set_footer(text=server_name, icon_url=server_icon_url)
+
+        try:
+            await interaction.response.edit_message(embed=second_embed, view=None)
+        except (discord.NotFound, discord.HTTPException) as e:
+            console.print(_format_error(f"Winner DM Edit #{row['id']}", str(e)))
+
+        try:
+            await self.cog.repo.mark_winner_dm(row["id"], self.member.id, True)
+            await self.cog.repo.log(
+                row["guild_id"], "winner_kept",
+                giveaway_id=row["id"], user_id=self.member.id,
+            )
+        except Exception as e:
+            console.print(_format_error(f"Winner DM Mark #{row['id']}", str(e)))
+
+        self.stop()
+
+    async def _on_no(self, interaction: discord.Interaction) -> None:
+        row = self.row
+        guild = self.member.guild
+
+        # Notify the host / staff that the winner declined
+        try:
+            await self.cog._notify_host_cancellation(guild, row, self.member, "reroll")
+        except Exception as e:
+            console.print(_format_error(f"Reroll Notify #{row['id']}", str(e)))
+
+        response_embed = discord.Embed(
+            title="Response recorded",
+            description=(
+                "Your response has been sent to the giveaway host.\n"
+                "They will handle the reroll manually."
+            ),
+            color=discord.Color(GREY_COLOR),
+        )
+
+        try:
+            await interaction.response.edit_message(embed=response_embed, view=None)
+        except (discord.NotFound, discord.HTTPException) as e:
+            console.print(_format_error(f"Winner DM Edit #{row['id']}", str(e)))
+
+        try:
+            await self.cog.repo.mark_winner_dm(row["id"], self.member.id, True)
+            await self.cog.repo.log(
+                row["guild_id"], "winner_cancelled",
+                giveaway_id=row["id"], user_id=self.member.id, action="reroll",
+            )
+        except Exception as e:
+            console.print(_format_error(f"Winner DM Log #{row['id']}", str(e)))
+
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+
 FLUSH_INTERVAL_SECONDS = 30
 SCHEDULER_INTERVAL_SECONDS = 15
+
 
 class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="Manage server giveaways"):
     def __init__(self, bot: commands.Bot, pool: asyncpg.Pool):
@@ -815,17 +990,18 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         await self._flush_message_cache()
 
     async def _has_permission(self, interaction: discord.Interaction) -> bool:
-        """Check if user has permission to use admin giveaway commands."""
+        """
+        Only event managers, senior moderators, admins, and (as a safety net)
+        users with the Administrator permission may manage giveaways.
+        """
         if not isinstance(interaction.user, discord.Member):
             return False
 
-        allowed_role_ids = _get_all_permission_role_ids()
+        allowed_role_ids = _get_giveaway_permission_role_ids(self.bot.config)
         if any(role.id in allowed_role_ids for role in interaction.user.roles):
             return True
 
         if interaction.user.guild_permissions.administrator:
-            return True
-        if interaction.user.guild_permissions.manage_guild:
             return True
 
         return False
@@ -837,10 +1013,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 view = GiveawayJoinView(
                     self, row["id"], row["button_style"], row["button_emoji"], row["button_label"]
                 )
-                self.bot.add_view(view, message_id=row["message_id"] if row["message_id"] else None)
+                self.bot.add_view(
+                    view, message_id=row["message_id"] if row["message_id"] else None
+                )
         except Exception as e:
             console.print(_format_error("View Restoration Failed", str(e)))
-
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -876,7 +1053,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         except Exception as e:
             console.print(_format_error("Count Reset Failed", str(e)))
 
-
     @tasks.loop(seconds=SCHEDULER_INTERVAL_SECONDS)
     async def scheduler_task(self) -> None:
         try:
@@ -910,27 +1086,22 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
     ) -> tuple[bool, Optional[str]]:
         member_role_ids = {r.id for r in member.roles}
 
-        # Get global blacklist from config
-        global_blacklist = _get_global_blacklist()
-        
-        # Check global blacklist if enabled
+        global_blacklist = _get_global_blacklist(self.bot.config)
+
         if row.get("use_global_blacklist", True):
             for blacklist_role in global_blacklist:
                 if blacklist_role in member_role_ids:
                     return False, "You are blacklisted from entering giveaways."
 
-        # Check giveaway-specific blacklist
         if any(r in member_role_ids for r in role_lists.get("blacklist", [])):
             return False, "You are blacklisted from entering this giveaway."
 
-        # Check bypass roles
         if any(r in member_role_ids for r in role_lists.get("bypass", [])):
             return True, None
 
-        # Check required roles
         required = role_lists.get("required", [])
         if required and not any(r in member_role_ids for r in required):
-            return False, "You do not possess required role for this giveaway."
+            return False, "You do not possess the required role for this giveaway."
 
         if row["required_booster"] and member.premium_since is None:
             return False, "Boost the server to enter."
@@ -994,7 +1165,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 return
 
             await self.repo.log(row["guild_id"], "entered", giveaway_id=giveaway_id, user_id=member.id)
-            await interaction.followup.send("You're entered! Good luck <a:x_confete:1538039846164234250>", ephemeral=True)
+            await interaction.followup.send(
+                f"You're entered! Good luck {EMOJIS['confetti']}", ephemeral=True
+            )
             await self._refresh_message(giveaway_id)
         except Exception as e:
             console.print(_format_error(f"Join Giveaway #{giveaway_id}", str(e)))
@@ -1031,7 +1204,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             console.print(_format_error(f"Leave Giveaway #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
-
     async def _refresh_message(self, giveaway_id: int) -> None:
         try:
             row = await self.repo.get_giveaway(giveaway_id)
@@ -1062,19 +1234,34 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
             embed = build_giveaway_embed(row, entry_count, role_lists, guild, winner_mentions)
 
-            view = None
-            if row["status"] == GiveawayStatus.ACTIVE.value:
-                view = GiveawayJoinView(self, giveaway_id, row["button_style"], row["button_emoji"], row["button_label"])
+            # Always build a V2 view — even for ended/cancelled giveaways we
+            # need a container to hold the updated embed. The buttons are
+            # disabled when the giveaway is no longer active.
+            view = GiveawayJoinView(
+                self,
+                giveaway_id,
+                row["button_style"],
+                row["button_emoji"],
+                row["button_label"],
+            )
+            if row["status"] != GiveawayStatus.ACTIVE.value:
+                disable_all_components(view)
 
             try:
-                await message.edit(embed=embed, view=view)
+                prepare_v2_view(view, embed)
+                await message.edit(view=view)
             except discord.HTTPException as e:
                 console.print(_format_error(f"Refresh Edit #{giveaway_id}", str(e)))
         except Exception as e:
             console.print(_format_error(f"Refresh Message #{giveaway_id}", str(e)))
 
     async def _select_winners(
-        self, guild: discord.Guild, giveaway_id: int, row: asyncpg.Record, count: int, exclude: set[int]
+        self,
+        guild: discord.Guild,
+        giveaway_id: int,
+        row: asyncpg.Record,
+        count: int,
+        exclude: set[int],
     ) -> list[discord.Member]:
         entrant_ids = await self.repo.get_entrant_ids(giveaway_id)
         role_lists = await self.repo.get_role_lists(giveaway_id)
@@ -1096,7 +1283,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         k = min(count, len(candidates))
         return random.SystemRandom().sample(candidates, k)
 
-
     async def end_giveaway(self, giveaway_id: int, is_manual: bool) -> list[discord.Member]:
         try:
             row = await self.repo.get_giveaway(giveaway_id)
@@ -1108,7 +1294,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await self.repo.set_status(giveaway_id, GiveawayStatus.ENDED)
                 return []
 
-            winners = await self._select_winners(guild, giveaway_id, row, row["winner_count"], exclude=set())
+            winners = await self._select_winners(
+                guild, giveaway_id, row, row["winner_count"], exclude=set()
+            )
             await self.repo.set_status(giveaway_id, GiveawayStatus.ENDED)
             if winners:
                 await self.repo.record_winners(giveaway_id, [w.id for w in winners], is_reroll=False)
@@ -1123,8 +1311,8 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
             if channel is not None:
                 if winners:
-                    reroll_hours = row.get("reroll_hours", 24)
-                    
+                    reroll_hours = row.get("reroll_hours") or DEFAULT_REROLL_HOURS
+
                     if len(winners) == 1:
                         mentions = winners[0].mention
                         congrats_text = f"Congratulations to {mentions}"
@@ -1135,15 +1323,20 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                         all_mentions = ", ".join(w.mention for w in winners[:-1])
                         mentions = f"{all_mentions}, and {winners[-1].mention}"
                         congrats_text = f"Congratulations to {mentions}"
-                    
+
                     await channel.send(
-                        f"{congrats_text} for winning the giveaway! Please create an **Event Ticket** to claim your prize or request a reroll! Failure to make a ticket within {reroll_hours} hour(s) will result in a reroll!\n-# If you do not know how to make a ticket please read <#1355434545285042216>",
+                        f"{congrats_text} for winning the giveaway! Please create an "
+                        f"**Event Ticket** to claim your prize or request a reroll! Failure "
+                        f"to make a ticket within {reroll_hours} hour(s) will result in a reroll!\n"
+                        f"-# If you do not know how to make a ticket please read <#1355434545285042216>",
                         allowed_mentions=discord.AllowedMentions(users=True),
                     )
                     announcement_embed = build_winner_announcement_embed(row, winners, guild)
                     await channel.send(embed=announcement_embed)
                 else:
-                    await channel.send(f"No valid entrants for **{row['prize']}** to be selected.")
+                    await channel.send(
+                        f"No valid entrants for **{row['prize']}** to be selected."
+                    )
 
             for w in winners:
                 asyncio.create_task(self._handle_winner_dm_interaction(w, row))
@@ -1160,96 +1353,85 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             console.print(_format_error(f"End Giveaway #{giveaway_id}", str(e)))
             return []
 
-
-    async def _handle_winner_dm_interaction(self, member: discord.Member, row: asyncpg.Record) -> None:
+    async def _handle_winner_dm_interaction(
+        self, member: discord.Member, row: asyncpg.Record
+    ) -> None:
+        """DM the winner with Yes/No buttons. Lifetime = reroll_hours."""
         try:
             guild = member.guild
             server_icon_url = guild.icon.url if guild.icon else None
             server_name = guild.name
 
+            reroll_hours = row.get("reroll_hours") or DEFAULT_REROLL_HOURS
+            if reroll_hours <= 0:
+                reroll_hours = DEFAULT_REROLL_HOURS
+            timeout_seconds = max(60, int(reroll_hours * 3600))
+
             prompt_embed = discord.Embed(
-                title=f"<a:x_confete:1538039846164234250> Congratulations on winning {row['prize']}!",
+                title=f"{EMOJIS['confetti']} Congratulations on winning {row['prize']}!",
                 description=(
                     "Would you like to keep it?\n\n"
-                    "If **yes** - Please reply this message with `yes`\n"
-                    "If **no** - Please reply this message with either `no`, `reroll`, or `cancel` to notify the event staff about this."
+                    "**Yes** — Keep the prize and open an event ticket to claim it.\n"
+                    "**No** — Request a reroll so someone else can win.\n\n"
+                    f"You have **{reroll_hours} hour(s)** to respond."
                 ),
-                color=discord.Color(row["color"]),
+                color=discord.Color(GREY_COLOR),
             )
             prompt_embed.set_footer(text=server_name, icon_url=server_icon_url)
 
+            view = WinnerConfirmView(self, row, member, timeout_seconds)
+
             try:
-                dm_message = await member.send(embed=prompt_embed)
+                dm_message = await member.send(embed=prompt_embed, view=view)
+                view.message = dm_message
             except (discord.Forbidden, discord.HTTPException) as e:
-                console.print(_format_error(f"DM Prompt #{row['id']}", f"Failed to DM {member}: {e}"))
+                console.print(
+                    _format_error(f"DM Prompt #{row['id']}", f"Failed to DM {member}: {e}")
+                )
                 await self._notify_staff_dm_failed(guild, row, member)
                 return
-
-            def check(m: discord.Message) -> bool:
-                return m.author == member and m.channel == dm_message.channel
-
-            try:
-                reply = await self.bot.wait_for("message", check=check, timeout=43200)
-            except asyncio.TimeoutError:
-                return
-
-            content = reply.content.strip().lower()
-            if content == "yes":
-                second_embed = discord.Embed(
-                    title="Hey there!!",
-                    description=(
-                        "It seems you like to take the prize.\n\n"
-                        "Please contact <a:mail:1537917503471095919> Event Team by opening an event ticket for your winning prize.\n\n"
-                        "**Objective** - Open a ticket through <#1535992504934072390>"
-                    ),
-                    color=discord.Color(row["color"]),
-                )
-                second_embed.set_footer(text=server_name, icon_url=server_icon_url)
-                await dm_message.edit(embed=second_embed)
-                await self.repo.mark_winner_dm(row["id"], member.id, True)
-
-            elif content in ("no", "reroll", "cancel"):
-                await self._notify_host_cancellation(guild, row, member, content)
-                await member.send(f"Your response '{content}' has been sent to the giveaway host. They will handle the reroll manually.")
-                await self.repo.log(row["guild_id"], "winner_cancelled", giveaway_id=row["id"],
-                                    user_id=member.id, action=content)
-            else:
-                pass
         except Exception as e:
             console.print(_format_error(f"Winner DM #{row['id']}", str(e)))
 
-    async def _notify_staff_dm_failed(self, guild: discord.Guild, row: asyncpg.Record, member: discord.Member) -> None:
+    async def _notify_staff_dm_failed(
+        self, guild: discord.Guild, row: asyncpg.Record, member: discord.Member
+    ) -> None:
         try:
             settings = await self.repo.get_guild_settings(guild.id)
             if settings and settings.get("staff_channel_id"):
                 channel = guild.get_channel(settings["staff_channel_id"])
                 if channel:
                     embed = discord.Embed(
-                        title=f"<:purple_warning:1537916196601733241> DM Failed - Giveaway #{row['id']}",
+                        title=f"{EMOJIS['warning']} DM Failed — Giveaway #{row['id']}",
                         description=(
                             f"Failed to send DM to winner {member.mention} for **{row['prize']}**.\n"
                             f"Reason: User has DMs disabled or blocked the bot.\n"
                             f"Please contact them manually or reroll if needed."
                         ),
-                        color=discord.Color.from_rgb(106, 13, 173),
+                        color=discord.Color(GREY_COLOR),
                     )
                     await channel.send(embed=embed)
         except Exception as e:
             console.print(_format_error(f"Staff DM Failed #{row['id']}", str(e)))
 
-
-    async def _notify_host_cancellation(self, guild: discord.Guild, row: asyncpg.Record,
-                                        winner: discord.Member, action: str) -> None:
+    async def _notify_host_cancellation(
+        self,
+        guild: discord.Guild,
+        row: asyncpg.Record,
+        winner: discord.Member,
+        action: str,
+    ) -> None:
         try:
             host = guild.get_member(row["host_id"])
             embed = discord.Embed(
                 title=f"Winner Response — Giveaway #{row['id']}",
                 description=(
-                    f"{winner.mention} has responded with **{action}** for their winning of **{row['prize']}**.\n"
+                    f"{winner.mention} has responded with **{action}** for their winning of "
+                    f"**{row['prize']}**.\n"
                     f"Action: `{action}`\n"
                     f"Please manually handle this response (reroll or reassign the prize)."
                 ),
-                color=discord.Color.from_rgb(106, 13, 173),
+                color=discord.Color(GREY_COLOR),
             )
             if host:
                 try:
@@ -1262,11 +1444,12 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             if settings and settings.get("staff_channel_id"):
                 channel = guild.get_channel(settings["staff_channel_id"])
                 if channel:
-                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+                    await channel.send(
+                        embed=embed, allowed_mentions=discord.AllowedMentions(users=True)
+                    )
                     return
         except Exception as e:
             console.print(_format_error(f"Response Notify #{row['id']}", str(e)))
-
 
     async def _assign_winner_role(self, member: discord.Member, role_id: int) -> bool:
         try:
@@ -1277,7 +1460,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await member.add_roles(role, reason="Giveaway winner role assignment")
                 return True
             except discord.Forbidden:
-                console.print(_format_error("Role Assign Forbidden", f"Could not assign role {role_id} to {member}"))
+                console.print(
+                    _format_error("Role Assign Forbidden", f"Could not assign role {role_id} to {member}")
+                )
                 return False
             except discord.HTTPException as e:
                 console.print(_format_error(f"Role Assign {role_id}", str(e)))
@@ -1285,7 +1470,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         except Exception as e:
             console.print(_format_error(f"Role Assign {role_id}", str(e)))
             return False
-
 
     async def _notify_staff(
         self,
@@ -1304,11 +1488,13 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
             jump_link = None
             if row["message_id"]:
-                jump_link = f"https://discord.com/channels/{guild.id}/{row['channel_id']}/{row['message_id']}"
+                jump_link = (
+                    f"https://discord.com/channels/{guild.id}/{row['channel_id']}/{row['message_id']}"
+                )
 
             embed = discord.Embed(
                 title=f"Giveaway {event.title()} — #{row['id']}",
-                color=discord.Color(row["color"]),
+                color=discord.Color(GREY_COLOR),
             )
             embed.add_field(name="Prize", value=row["prize"], inline=True)
             embed.add_field(name="Host", value=f"<@{row['host_id']}>", inline=True)
@@ -1328,7 +1514,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 console.print(_format_error(f"Notify Staff #{row['id']}", str(e)))
         except Exception as e:
             console.print(_format_error(f"Notify Staff #{row['id']}", str(e)))
-
 
     def _parse_duration(self, text: str) -> Optional[int]:
         pattern = re.compile(r"(\d+)\s*(d|h|m|s)", re.IGNORECASE)
@@ -1351,11 +1536,12 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 ids.append(int(match.group()))
         return ids
 
-    @app_commands.command(name="messages", description="View your or another user's daily, weekly, and total message count")
+    @app_commands.command(
+        name="messages",
+        description="View your or another user's daily, weekly, and total message count",
+    )
     async def messages(
-        self,
-        interaction: discord.Interaction,
-        user: Optional[discord.Member] = None,
+        self, interaction: discord.Interaction, user: Optional[discord.Member] = None
     ) -> None:
         try:
             await interaction.response.defer(ephemeral=True)
@@ -1368,39 +1554,38 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             return
 
         target = user or interaction.user
-        
+
         counts = await self.repo.get_message_counts(guild.id, target.id)
-        
+
         cached = self._message_cache.get((guild.id, target.id), 0)
         daily_total = counts["daily"] + cached
-        
         weekly_total = counts["weekly"] + cached
         lifetime_total = counts["lifetime"] + cached
 
         embed = discord.Embed(
-            title=f"<a:stats:1537921547774205972> Message Counts for {target.display_name}",
-            color=discord.Color.from_rgb(106, 13, 173),
-            timestamp=discord.utils.utcnow()
+            title=f"{EMOJIS['stats']} Message Counts for {target.display_name}",
+            color=discord.Color(GREY_COLOR),
+            timestamp=discord.utils.utcnow(),
         )
-        
+
         embed.add_field(
-            name="<a:calendar:1538057240836182036> Daily",
+            name=f"{EMOJIS['calendar']} Daily",
             value=f"**{daily_total}** messages\n*(Resets in 24 hours)*",
-            inline=True
+            inline=True,
         )
         embed.add_field(
-            name="<a:calendar:1538057240836182036> Weekly",
+            name=f"{EMOJIS['calendar']} Weekly",
             value=f"**{weekly_total}** messages\n*(Resets in 7 days)*",
-            inline=True
+            inline=True,
         )
         embed.add_field(
-            name="<:chart:1537919996984959046> Lifetime",
+            name=f"{EMOJIS['chart']} Lifetime",
             value=f"**{lifetime_total}** messages",
-            inline=True
+            inline=True,
         )
-        
+
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-        
+
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="start", description="Start a new giveaway")
@@ -1420,7 +1605,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         required_join_age_days="Minimum server membership age in days",
         required_booster="Require the user to be a Server Booster",
         winner_role="Role automatically given to winners",
-        color="Hex color for the embed, e.g. #5865F2",
         image_url="Image URL for the embed",
         thumbnail_url="Thumbnail URL for the embed",
         button_label="Text on the entry button",
@@ -1448,7 +1632,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         prize: str,
         winners: app_commands.Range[int, 1, 100],
         duration: str,
-        reroll_hours: app_commands.Range[int, 1, 168] = 12,
+        reroll_hours: app_commands.Range[int, 1, 168] = DEFAULT_REROLL_HOURS,
         author: Optional[str] = None,
         channel: Optional[discord.TextChannel] = None,
         description: Optional[str] = None,
@@ -1460,16 +1644,21 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         required_join_age_days: Optional[app_commands.Range[int, 0, 3650]] = 0,
         required_booster: Optional[bool] = False,
         winner_role: Optional[discord.Role] = None,
-        color: Optional[str] = None,
         image_url: Optional[str] = None,
         thumbnail_url: Optional[str] = None,
         button_label: Optional[str] = "Enter Giveaway",
-        button_emoji: Optional[str] = "<a:x_confete:1538039846164234250>",
+        button_emoji: Optional[str] = f"{EMOJIS['confetti']}",
         button_style: Optional[app_commands.Choice[str]] = None,
         sponsor: Optional[str] = None,
         mention_role: Optional[discord.Role] = None,
         use_global_blacklist: Optional[bool] = True,
     ) -> None:
+        if not await self._has_permission(interaction):
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
+            return
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1496,26 +1685,15 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await interaction.followup.send("Please choose a valid text channel.", ephemeral=True)
                 return
 
-            parsed_color = DARK_PURPLE
-            if color:
-                try:
-                    parsed_color = int(color.lstrip("#"), 16)
-                except ValueError:
-                    await interaction.followup.send("Invalid color hex code.", ephemeral=True)
-                    return
-
             if author is None:
                 author = interaction.user.display_name
 
-            # Get global blacklist from config
-            global_blacklist = _get_global_blacklist()
-
+            global_blacklist = _get_global_blacklist(self.bot.config)
             parsed_blacklist = self._parse_role_list(guild, blacklist_roles)
-            
-            # Only add global blacklist if use_global_blacklist is True
+
             if use_global_blacklist:
                 parsed_blacklist = list(set(parsed_blacklist + global_blacklist))
-            
+
             settings = GiveawaySettings(
                 guild_id=guild.id,
                 channel_id=target_channel.id,
@@ -1526,12 +1704,14 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 duration_seconds=seconds,
                 reroll_hours=reroll_hours,
                 description=description,
-                color=parsed_color,
-                button_style=(button_style.value if button_style else "primary"),
+                color=GREY_COLOR,
+                button_style=(button_style.value if button_style else "secondary"),
                 button_emoji=button_emoji,
                 button_label=button_label or "Enter Giveaway",
                 required_message_count=required_messages or 0,
-                required_message_period=(message_period.value if message_period else MessageRequirementPeriod.DAILY.value),
+                required_message_period=(
+                    message_period.value if message_period else MessageRequirementPeriod.DAILY.value
+                ),
                 required_join_age_days=required_join_age_days or 0,
                 required_booster=bool(required_booster),
                 winner_role_id=winner_role.id if winner_role else None,
@@ -1557,14 +1737,18 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 except discord.HTTPException as e:
                     console.print(_format_error(f"Mention Role #{giveaway_id}", str(e)))
 
-            view = GiveawayJoinView(self, giveaway_id, settings.button_style, settings.button_emoji, settings.button_label)
+            view = GiveawayJoinView(
+                self, giveaway_id, settings.button_style, settings.button_emoji, settings.button_label
+            )
 
             try:
-                message = await target_channel.send(embed=embed, view=view)
+                prepare_v2_view(view, embed)
+                message = await target_channel.send(view=view)
             except discord.HTTPException as e:
                 console.print(_format_error(f"Start Send #{giveaway_id}", str(e)))
                 await interaction.followup.send(
-                    "I couldn't post the giveaway message — check my permissions in that channel.", ephemeral=True
+                    "I couldn't post the giveaway message — check my permissions in that channel.",
+                    ephemeral=True,
                 )
                 return
 
@@ -1575,15 +1759,17 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 f"Giveaway **#{giveaway_id}** started in {target_channel.mention}.", ephemeral=True
             )
         except Exception as e:
-            console.print(_format_error(f"Start Giveaway", str(e)))
+            console.print(_format_error("Start Giveaway", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="end", description="End a giveaway immediately")
     async def end(self, interaction: discord.Interaction, giveaway_id: int) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1599,7 +1785,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 return
             winners = await self.end_giveaway(giveaway_id, is_manual=True)
             summary = ", ".join(w.mention for w in winners) if winners else "no eligible entrants"
-            await interaction.followup.send(f"Giveaway **#{giveaway_id}** ended. Winners: {summary}", ephemeral=True)
+            await interaction.followup.send(
+                f"Giveaway **#{giveaway_id}** ended. Winners: {summary}", ephemeral=True
+            )
         except Exception as e:
             console.print(_format_error(f"End Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
@@ -1607,9 +1795,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
     @app_commands.command(name="cancel", description="Cancel a giveaway without selecting winners")
     async def cancel(self, interaction: discord.Interaction, giveaway_id: int) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1625,7 +1815,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 return
             await self.repo.set_status(giveaway_id, GiveawayStatus.CANCELLED)
             await self._refresh_message(giveaway_id)
-            await self.repo.log(interaction.guild_id, "cancelled", giveaway_id=giveaway_id, by=interaction.user.id)
+            await self.repo.log(
+                interaction.guild_id, "cancelled", giveaway_id=giveaway_id, by=interaction.user.id
+            )
             await interaction.followup.send(f"Giveaway **#{giveaway_id}** cancelled.", ephemeral=True)
         except Exception as e:
             console.print(_format_error(f"Cancel Command #{giveaway_id}", str(e)))
@@ -1633,12 +1825,17 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
     @app_commands.command(name="reroll", description="Reroll winners for an ended giveaway")
     async def reroll(
-        self, interaction: discord.Interaction, giveaway_id: int, count: Optional[app_commands.Range[int, 1, 100]] = None
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: int,
+        count: Optional[app_commands.Range[int, 1, 100]] = None,
     ) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1669,7 +1866,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             channel = guild.get_channel(row["channel_id"])
             if channel is not None:
                 mentions = ", ".join(w.mention for w in new_winners)
-                await channel.send(f"<a:6_reroll:1538066510981890098> New winner(s) for **{row['prize']}**: {mentions}")
+                await channel.send(
+                    f"{EMOJIS['reroll']} New winner(s) for **{row['prize']}**: {mentions}"
+                )
 
             for w in new_winners:
                 asyncio.create_task(self._handle_winner_dm_interaction(w, row))
@@ -1694,7 +1893,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         description="New description",
         winners="New number of winners",
         duration="New duration, e.g. '1d12h', '30m', '2h'",
-        color="New hex color for the embed, e.g. #5865F2",
         image_url="New image URL for the embed",
         required_roles="New required roles",
         blacklist_roles="New blacklist roles (use 'clear' to remove all)",
@@ -1710,7 +1908,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         description: Optional[str] = None,
         winners: Optional[app_commands.Range[int, 1, 100]] = None,
         duration: Optional[str] = None,
-        color: Optional[str] = None,
         image_url: Optional[str] = None,
         required_roles: Optional[str] = None,
         blacklist_roles: Optional[str] = None,
@@ -1719,9 +1916,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         use_global_blacklist: Optional[bool] = None,
     ) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1749,12 +1948,6 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 updates["winner_role_id"] = winner_role.id
             if use_global_blacklist is not None:
                 updates["use_global_blacklist"] = use_global_blacklist
-            if color is not None:
-                try:
-                    updates["color"] = int(color.lstrip("#"), 16)
-                except ValueError:
-                    await interaction.followup.send("Invalid color hex code.", ephemeral=True)
-                    return
             if duration is not None:
                 seconds = self._parse_duration(duration)
                 if seconds is None:
@@ -1767,56 +1960,53 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
             guild = interaction.guild
             assert guild is not None
-            
-            # Get global blacklist from config
-            global_blacklist = _get_global_blacklist()
-            
+
+            global_blacklist = _get_global_blacklist(self.bot.config)
+
             if required_roles is not None:
                 await self.repo.replace_role_list(
                     giveaway_id, RoleListType.REQUIRED, self._parse_role_list(guild, required_roles)
                 )
-            
+
             if blacklist_roles is not None:
-                # Special handling for "clear" keyword
                 if blacklist_roles.strip().lower() == "clear":
                     parsed_blacklist = []
                 else:
                     parsed_blacklist = self._parse_role_list(guild, blacklist_roles)
-                
-                # Check current use_global_blacklist setting - use the new value if provided, otherwise use existing
+
                 current_row = await self.repo.get_giveaway(giveaway_id)
-                should_use_global = use_global_blacklist if use_global_blacklist is not None else current_row.get("use_global_blacklist", True)
-                
-                # Only add global blacklist if use_global_blacklist is True
+                should_use_global = (
+                    use_global_blacklist
+                    if use_global_blacklist is not None
+                    else current_row.get("use_global_blacklist", True)
+                )
+
                 if should_use_global:
                     parsed_blacklist = list(set(parsed_blacklist + global_blacklist))
-                # If use_global_blacklist is False, we need to remove any global blacklist roles from the parsed list
                 else:
-                    # Remove any global blacklist roles from the parsed list
                     parsed_blacklist = [r for r in parsed_blacklist if r not in global_blacklist]
-                
+
                 await self.repo.replace_role_list(
                     giveaway_id, RoleListType.BLACKLIST, parsed_blacklist
                 )
             elif use_global_blacklist is not None and use_global_blacklist is False:
-                # If use_global_blacklist was changed to False but blacklist_roles wasn't provided,
-                # we need to remove the global blacklist from the existing blacklist
                 current_blacklist = await self.repo.get_role_lists(giveaway_id)
                 existing_blacklist = current_blacklist.get("blacklist", [])
-                # Remove any global blacklist roles
                 updated_blacklist = [r for r in existing_blacklist if r not in global_blacklist]
                 if updated_blacklist != existing_blacklist:
                     await self.repo.replace_role_list(
                         giveaway_id, RoleListType.BLACKLIST, updated_blacklist
                     )
-            
+
             if bypass_roles is not None:
                 await self.repo.replace_role_list(
                     giveaway_id, RoleListType.BYPASS, self._parse_role_list(guild, bypass_roles)
                 )
 
             await self._refresh_message(giveaway_id)
-            await self.repo.log(interaction.guild_id, "edited", giveaway_id=giveaway_id, by=interaction.user.id)
+            await self.repo.log(
+                interaction.guild_id, "edited", giveaway_id=giveaway_id, by=interaction.user.id
+            )
             await interaction.followup.send(f"Giveaway **#{giveaway_id}** updated.", ephemeral=True)
         except Exception as e:
             console.print(_format_error(f"Edit Command #{giveaway_id}", str(e)))
@@ -1825,9 +2015,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
     @app_commands.command(name="list", description="List active giveaways in this server")
     async def list_giveaways(self, interaction: discord.Interaction) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1850,9 +2042,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
     @app_commands.command(name="info", description="Show details about a giveaway")
     async def info(self, interaction: discord.Interaction, giveaway_id: int) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1870,7 +2064,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 latest = await self.repo.get_latest_winners(giveaway_id)
                 if latest:
                     winner_mentions = [f"<@{w['user_id']}>" for w in latest]
-            embed = build_giveaway_embed(row, entry_count, role_lists, interaction.guild, winner_mentions)
+            embed = build_giveaway_embed(
+                row, entry_count, role_lists, interaction.guild, winner_mentions
+            )
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             console.print(_format_error(f"Info Command #{giveaway_id}", str(e)))
@@ -1878,12 +2074,17 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
     @app_commands.command(name="entrants", description="List entrants for a giveaway (paginated)")
     async def entrants(
-        self, interaction: discord.Interaction, giveaway_id: int, page: app_commands.Range[int, 1, 100000] = 1
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: int,
+        page: app_commands.Range[int, 1, 100000] = 1,
     ) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1913,9 +2114,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
     @app_commands.command(name="refresh", description="Force-refresh a giveaway's embed message")
     async def refresh(self, interaction: discord.Interaction, giveaway_id: int) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1932,7 +2135,10 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             console.print(_format_error(f"Refresh Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
-    @app_commands.command(name="settings", description="Configure staff notification settings for this server")
+    @app_commands.command(
+        name="settings",
+        description="Configure staff notification settings for this server",
+    )
     async def settings_cmd(
         self,
         interaction: discord.Interaction,
@@ -1941,9 +2147,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         manager_role: Optional[discord.Role] = None,
     ) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1969,11 +2177,15 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="logs", description="Show recent giveaway activity logs")
-    async def logs_cmd(self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 25) -> None:
+    async def logs_cmd(
+        self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 25
+    ) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -1994,22 +2206,27 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             console.print(_format_error("Logs Command", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
-    @app_commands.command(name="clear", description="Clear all giveaway data (preserves message counts)")
+    @app_commands.command(
+        name="clear", description="Clear all giveaway data (preserves message counts)"
+    )
     async def clear(self, interaction: discord.Interaction) -> None:
         if not await self._has_permission(interaction):
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "You don't have permission to use this command.", ephemeral=True
+            )
             return
-            
+
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
             return
+
         try:
             await self.repo.clear_all_giveaway_data()
             await interaction.followup.send(
-                "<a:tick:1537915747454554222> All giveaway data cleared!\n"
-                "<a:stats:1537921547774205972> Message counts preserved.",
-                ephemeral=True
+                f"{EMOJIS['tick']} All giveaway data cleared!\n"
+                f"{EMOJIS['stats']} Message counts preserved.",
+                ephemeral=True,
             )
         except Exception as e:
             console.print(_format_error("Clear All Data", str(e)))
@@ -2017,25 +2234,10 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
 
 
 async def setup(bot: commands.Bot) -> None:
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        console.print(_format_error("Setup Failed", "DATABASE_URL environment variable is not set."))
-        raise RuntimeError("DATABASE_URL environment variable is not set.")
-
-    pool: asyncpg.Pool = getattr(bot, "pg_pool", None)
+    pool: asyncpg.Pool = getattr(bot, "pool", None)
     if pool is None:
-        try:
-            pool = await asyncpg.create_pool(
-                dsn=database_url,
-                min_size=5,
-                max_size=20,
-                command_timeout=30,
-                max_inactive_connection_lifetime=300,
-            )
-            bot.pg_pool = pool
-        except Exception as e:
-            console.print(_format_error("Database Pool Creation", str(e)))
-            raise
+        raise RuntimeError("The shared PostgreSQL pool was not initialized by main.py.")
+    bot.pg_pool = pool  # compatibility alias; never create or close a second pool here
 
     cog = GiveawayCog(bot, pool)
     await bot.add_cog(cog)
