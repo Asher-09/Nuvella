@@ -6,6 +6,7 @@ from discord.ext import commands
 import asyncpg
 from dotenv import load_dotenv
 
+from utils.emoji import EMOJIS
 load_dotenv()
 
 HI_COOLDOWN = 600
@@ -20,26 +21,7 @@ LOSS_COLOR = 0xe74c3c
 DEFAULT_WELCOME_CHANNEL_ID = 1535962095663980546
 
 # ── Custom Discord Emote Constants ──
-EMOJI_TICK      = "<a:tick:1537915747454554222>"
-EMOJI_WRONG     = "<:cross:1537915734087303199>"
-EMOJI_WARN      = "<:purple_warning:1537916196601733241>"
-PANDA_WAVE      = "<a:panda_wave:1538059749239558235>"
-PURPLE_ZZZ      = "<:purple_zzz:1538059843376648253>"
-COOLDOWN_EMOJI  = "<a:cooldown:1537918560616185956>"
-W_PINNED        = "<:pin_purple:1537913946357366824>"
-SCROLL_EMOJI    = "<:scroll:1537914407663968306>"
 
-NUVELLA      = "<:moon:1537924074703945778>"
-GREET       = "<a:Golden_Greeting:1538061705446293657>"
-MEMO           = "<:q_notes:1537922139431370854>"
-STOPWATCH      = "<a:cooldown:1537918560616185956>"
-REFRESH        = "<a:hy_refresh:1538061364495515699>"
-MAGNIFY        = "<:search:1537921248368132177>"
-HIGH_VOLTAGE   = "<a:lightning:1537924519178674226>"
-CLIPBOARD      = "<:scroll:1537914407663968306>"
-BROOM          = "<a:cleaning_broom:1538062366460215367>"
-WASTEBASKET    = "<:Deleted:1537919221969846413>"
-MAILBOX_EMPTY  = "<a:mail:1537917503471095919>"
 
 
 def embed_base(title, description, color=MAIN_COLOR, ctx=None):
@@ -116,11 +98,9 @@ class Extra(commands.Cog):
         with open("config.json", "r") as f:
             self.config_data = json.load(f)
 
-        DATABASE_URL = os.getenv("DATABASE_URL")
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL environment variable not set.")
-
-        self.pool = await asyncpg.create_pool(dsn=DATABASE_URL)
+        self.pool = getattr(self.bot, "pool", None)
+        if self.pool is None:
+            raise RuntimeError("The shared PostgreSQL pool was not initialized by main.py.")
 
         async with self.pool.acquire() as conn:
             await conn.execute("""
@@ -158,8 +138,8 @@ class Extra(commands.Cog):
             """)
 
     async def cog_unload(self):
-        if self.pool:
-            await self.pool.close()
+        # The PostgreSQL pool belongs to the bot and is shared by every cog.
+        return
 
     # ─── Helper: Get logging channel ID from config ───
     def get_logging_channel_id(self) -> int | None:
@@ -229,7 +209,7 @@ class Extra(commands.Cog):
         if not channel:
             return
         embed = discord.Embed(
-            title=f"{NUVELLA} Welcome!",
+            title=f"{EMOJIS["moon"]} Welcome!",
             description=(
                 f"Hey lunar traveller {member.mention}, enjoy your time here and if you want roles go to "
                 f"<#1536190617359482990> and Check about the server in <#1535962074415505510>"
@@ -275,7 +255,7 @@ class Extra(commands.Cog):
     async def welcome_group(self, ctx):
         state = "ENABLED" if await self.get_welcome_enabled(ctx.guild.id) else "DISABLED"
         embed = embed_base(
-            f"{NUVELLA} Welcome System",
+            f"{EMOJIS["moon"]} Welcome System",
             f"The welcomer is currently **{state}**.\n"
             f"Use `{ctx.clean_prefix}welcome on` or `{ctx.clean_prefix}welcome off` to toggle.\n"
             f"*Requires Owner, Admin, Mod, Trial Mod, or Event Manager roles.*",
@@ -288,14 +268,14 @@ class Extra(commands.Cog):
     @elevated_perms_check()
     async def welcome_on(self, ctx):
         await self.set_welcome_enabled(ctx.guild.id, True)
-        embed = embed_base(f"{EMOJI_TICK} Welcome Enabled", "New members will now receive a welcome message.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} Welcome Enabled", "New members will now receive a welcome message.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @welcome_group.command(name="off")
     @elevated_perms_check()
     async def welcome_off(self, ctx):
         await self.set_welcome_enabled(ctx.guild.id, False)
-        embed = embed_base(f"{EMOJI_WRONG} Welcome Disabled", "The welcome message has been turned off.", LOSS_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["cross"]} Welcome Disabled", "The welcome message has been turned off.", LOSS_COLOR, ctx)
         await ctx.send(embed=embed)
 
     # ─── Custom Greet DB helpers ──────────────────────
@@ -346,12 +326,12 @@ class Extra(commands.Cog):
     @elevated_perms_check()
     async def customgreet_group(self, ctx):
         cfg = await self.get_customgreet_config(ctx.guild.id)
-        status = f"{EMOJI_TICK} Enabled" if cfg["enabled"] else f"{EMOJI_WRONG} Disabled"
+        status = f"{EMOJIS["tick"]} Enabled" if cfg["enabled"] else f"{EMOJIS["cross"]} Disabled"
         cooldown_min = cfg["cooldown"] // 60
         roles_mentions = ", ".join(f"<@&{rid}>" for rid in cfg["role_ids"]) or "None"
         users_mentions = ", ".join(f"<@{uid}>" for uid in cfg["user_ids"]) or "None"
         embed = embed_base(
-            f"{GREET} Custom Greet System",
+            f"{EMOJIS["greet"]} Custom Greet System",
             f"**Status:** {status}\n"
             f"**Message:** {cfg['message']}\n"
             f"**Inactivity cooldown:** {cooldown_min} minute(s)\n"
@@ -368,21 +348,21 @@ class Extra(commands.Cog):
     @elevated_perms_check()
     async def customgreet_on(self, ctx):
         await self.update_customgreet_config(ctx.guild.id, enabled=True)
-        embed = embed_base(f"{EMOJI_TICK} Custom Greet Enabled", "The bot will now greet returning users.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} Custom Greet Enabled", "The bot will now greet returning users.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.command(name="off")
     @elevated_perms_check()
     async def customgreet_off(self, ctx):
         await self.update_customgreet_config(ctx.guild.id, enabled=False)
-        embed = embed_base(f"{EMOJI_WRONG} Custom Greet Disabled", "The bot will no longer greet returning users.", LOSS_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["cross"]} Custom Greet Disabled", "The bot will no longer greet returning users.", LOSS_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.command(name="message")
     @elevated_perms_check()
     async def customgreet_message(self, ctx, *, message: str):
         await self.update_customgreet_config(ctx.guild.id, message=message)
-        embed = embed_base(f"{MEMO} Greeting Message Set", f"New message: {message}", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["notes"]} Greeting Message Set", f"New message: {message}", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.command(name="cooldown")
@@ -391,14 +371,14 @@ class Extra(commands.Cog):
         if minutes < 1:
             return await ctx.send(embed=embed_base("Invalid Cooldown", "Must be at least 1 minute.", LOSS_COLOR, ctx))
         await self.update_customgreet_config(ctx.guild.id, cooldown=minutes * 60)
-        embed = embed_base(f"{STOPWATCH} Cooldown Updated", f"Inactivity threshold set to **{minutes}** minute(s).", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["cooldown"]} Cooldown Updated", f"Inactivity threshold set to **{minutes}** minute(s).", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.command(name="reset")
     @elevated_perms_check()
     async def customgreet_reset(self, ctx):
         await self.reset_customgreet_times(ctx.guild.id)
-        embed = embed_base(f"{REFRESH} Times Reset", "All last‑message times have been cleared.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["refresh"]} Times Reset", "All last‑message times have been cleared.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.group(name="role")
@@ -415,7 +395,7 @@ class Extra(commands.Cog):
             return await ctx.send(embed=embed_base("Already Added", f"{role.mention} is already in the greet list.", LOSS_COLOR, ctx))
         new_roles = list(cfg["role_ids"]) + [role.id]
         await self.update_customgreet_config(ctx.guild.id, role_ids=new_roles)
-        embed = embed_base(f"{EMOJI_TICK} Role Added", f"Members with {role.mention} will now be greeted upon return.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} Role Added", f"Members with {role.mention} will now be greeted upon return.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_role.command(name="remove")
@@ -426,7 +406,7 @@ class Extra(commands.Cog):
             return await ctx.send(embed=embed_base("Not Found", f"{role.mention} is not in the greet list.", LOSS_COLOR, ctx))
         new_roles = [r for r in cfg["role_ids"] if r != role.id]
         await self.update_customgreet_config(ctx.guild.id, role_ids=new_roles)
-        embed = embed_base(f"{EMOJI_TICK} Role Removed", f"Members with {role.mention} will no longer be greeted.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} Role Removed", f"Members with {role.mention} will no longer be greeted.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_group.group(name="user")
@@ -443,7 +423,7 @@ class Extra(commands.Cog):
             return await ctx.send(embed=embed_base("Already Added", f"{member.mention} is already in the greet list.", LOSS_COLOR, ctx))
         new_users = list(cfg["user_ids"]) + [member.id]
         await self.update_customgreet_config(ctx.guild.id, user_ids=new_users)
-        embed = embed_base(f"{EMOJI_TICK} User Added", f"{member.mention} will now be greeted upon return.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} User Added", f"{member.mention} will now be greeted upon return.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @customgreet_user.command(name="remove")
@@ -454,7 +434,7 @@ class Extra(commands.Cog):
             return await ctx.send(embed=embed_base("Not Found", f"{member.mention} is not in the greet list.", LOSS_COLOR, ctx))
         new_users = [u for u in cfg["user_ids"] if u != member.id]
         await self.update_customgreet_config(ctx.guild.id, user_ids=new_users)
-        embed = embed_base(f"{EMOJI_TICK} User Removed", f"{member.mention} will no longer be greeted.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["tick"]} User Removed", f"{member.mention} will no longer be greeted.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     # ─── Message Listener ─────────────────────────────
@@ -512,7 +492,7 @@ class Extra(commands.Cog):
             if not is_command:
                 await self.remove_afk(user_id)
                 embed = embed_base(
-                    f"{PANDA_WAVE} Welcome Back!",
+                    f"{EMOJIS["panda_wave"]} Welcome Back!",
                     "Your AFK status has been removed.",
                     WIN_COLOR
                 )
@@ -534,7 +514,7 @@ class Extra(commands.Cog):
                 reason = afk_data["reason"]
                 since = afk_data["timestamp"]
                 embed = embed_base(
-                    f"{PURPLE_ZZZ} User is AFK",
+                    f"{EMOJIS["purple_zzz"]} User is AFK",
                     f"{mentioned.mention} is currently AFK.",
                     MAIN_COLOR
                 )
@@ -611,7 +591,7 @@ class Extra(commands.Cog):
         now = int(time.time())
         await self.set_afk(ctx.author.id, reason, now)
         embed = embed_base(
-            f"{PURPLE_ZZZ} AFK Set",
+            f"{EMOJIS["purple_zzz"]} AFK Set",
             f"{ctx.author.mention} is now AFK.",
             WIN_COLOR
         )
@@ -623,7 +603,7 @@ class Extra(commands.Cog):
     async def afk_error(self, ctx, error):
         if isinstance(error, commands.CommandOnCooldown):
             embed = embed_base(
-                f"{COOLDOWN_EMOJI} Slow Down",
+                f"{EMOJIS["cooldown"]} Slow Down",
                 f"Try again in {error.retry_after:.0f}s.",
                 LOSS_COLOR
             )
@@ -639,7 +619,7 @@ class Extra(commands.Cog):
         google_url = f"https://images.google.com/searchbyimage?image_url={avatar_url}"
         tineye_url = f"https://tineye.com/search?url={avatar_url}"
         embed = discord.Embed(
-            title=f"{MAGNIFY} Catfish Check",
+            title=f"{EMOJIS["search"]} Catfish Check",
             description=(
                 f"Reverse image search for **{user.display_name}**'s profile picture.\n\n"
                 f"[ Yandex]({yandex_url})\n"
@@ -660,13 +640,13 @@ class Extra(commands.Cog):
     async def catfish_error(self, ctx, error):
         if isinstance(error, commands.CommandOnCooldown):
             embed = embed_base(
-                f"{COOLDOWN_EMOJI} Slow Down",
+                f"{EMOJIS["cooldown"]} Slow Down",
                 f"Try again in {error.retry_after:.0f}s.",
                 LOSS_COLOR
             )
             await ctx.send(embed=embed, delete_after=5)
         elif isinstance(error, commands.BadArgument):
-            embed = embed_base(f"{EMOJI_WRONG} Error", "Member not found.", LOSS_COLOR)
+            embed = embed_base(f"{EMOJIS["cross"]} Error", "Member not found.", LOSS_COLOR)
             await ctx.send(embed=embed)
 
     # ─── Trigger Management Commands (elevated perms) ──
@@ -674,14 +654,14 @@ class Extra(commands.Cog):
     @elevated_perms_check()
     async def triggers_group(self, ctx):
         prefix = ctx.clean_prefix
-        embed = embed_base(f"{HIGH_VOLTAGE} Trigger System Help", "", MAIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["lightning"]} Trigger System Help", "", MAIN_COLOR, ctx)
         embed.description = (
             "Manage auto‑response triggers that fire when a certain word or mention is detected.\n"
             f"All commands require **Owner, Admin, Mod, Trial Mod, or Event Manager** permissions.\n\n"
             f"**Prefix:** `{prefix}`"
         )
         embed.add_field(
-            name=f"{W_PINNED} Add a trigger",
+            name=f"{EMOJIS["pin"]} Add a trigger",
             value=(
                 f"`{prefix}triggers add <trigger> <type> <response>`\n"
                 "**Types:** `text`, `image`, `gif`\n"
@@ -693,17 +673,17 @@ class Extra(commands.Cog):
             inline=False
         )
         embed.add_field(
-            name=f"{EMOJI_WRONG} Remove a trigger",
+            name=f"{EMOJIS["cross"]} Remove a trigger",
             value=f"`{prefix}triggers remove <trigger>`",
             inline=False
         )
         embed.add_field(
-            name=f"{CLIPBOARD} List all triggers",
+            name=f"{EMOJIS["scroll"]} List all triggers",
             value=f"`{prefix}triggers list`",
             inline=False
         )
         embed.add_field(
-            name=f"{BROOM} Clear all triggers",
+            name=f"{EMOJIS["broom"]} Clear all triggers",
             value=f"`{prefix}triggers clear`",
             inline=False
         )
@@ -717,7 +697,7 @@ class Extra(commands.Cog):
         response_type = response_type.lower()
         if response_type not in valid_types:
             embed = embed_base(
-                f"{EMOJI_WRONG} Invalid Type",
+                f"{EMOJIS["cross"]} Invalid Type",
                 f"Please use one of: {', '.join(valid_types)}",
                 LOSS_COLOR, ctx
             )
@@ -725,7 +705,7 @@ class Extra(commands.Cog):
         trigger = trigger.lower()
         await self.add_trigger_to_db(ctx.guild.id, trigger, response_type, response)
         embed = embed_base(
-            f"{EMOJI_TICK} Trigger Added",
+            f"{EMOJIS["tick"]} Trigger Added",
             f"**{trigger}** → *{response_type}*\nResponse: {response}",
             WIN_COLOR, ctx
         )
@@ -737,9 +717,9 @@ class Extra(commands.Cog):
         trigger = trigger.lower()
         success = await self.remove_trigger_from_db(ctx.guild.id, trigger)
         if success:
-            embed = embed_base(f"{WASTEBASKET} Trigger Removed", f"`{trigger}` has been deleted.", WIN_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["delete"]} Trigger Removed", f"`{trigger}` has been deleted.", WIN_COLOR, ctx)
         else:
-            embed = embed_base(f"{EMOJI_WRONG} Not Found", f"No trigger named `{trigger}`.", LOSS_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["cross"]} Not Found", f"No trigger named `{trigger}`.", LOSS_COLOR, ctx)
         await ctx.send(embed=embed)
 
     @triggers_group.command(name="list")
@@ -747,9 +727,9 @@ class Extra(commands.Cog):
     async def list_triggers(self, ctx):
         triggers = await self.get_triggers(ctx.guild.id)
         if not triggers:
-            embed = embed_base(f"{MAILBOX_EMPTY} No Triggers", "There are no triggers set up yet.", MAIN_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["mail"]} No Triggers", "There are no triggers set up yet.", MAIN_COLOR, ctx)
             return await ctx.send(embed=embed)
-        embed = embed_base(f"{SCROLL_EMOJI} Active Triggers", "", MAIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["scroll"]} Active Triggers", "", MAIN_COLOR, ctx)
         for trigger, data in triggers.items():
             value = f"**Type:** {data['type']}\n**Response:** {data['response']}"
             embed.add_field(name=trigger, value=value, inline=False)
@@ -759,23 +739,23 @@ class Extra(commands.Cog):
     @elevated_perms_check()
     async def clear_triggers(self, ctx):
         await self.clear_triggers_db(ctx.guild.id)
-        embed = embed_base(f"{BROOM} Triggers Cleared", "All triggers have been removed.", WIN_COLOR, ctx)
+        embed = embed_base(f"{EMOJIS["broom"]} Triggers Cleared", "All triggers have been removed.", WIN_COLOR, ctx)
         await ctx.send(embed=embed)
 
     # ─── Error handling ───────────────────────────────
     async def cog_command_error(self, ctx, error):
         if isinstance(error, commands.BadArgument):
-            embed = embed_base(f"{EMOJI_WRONG} Invalid Argument", "The argument you provided is not valid. Please check the command usage.", LOSS_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["cross"]} Invalid Argument", "The argument you provided is not valid. Please check the command usage.", LOSS_COLOR, ctx)
             await ctx.send(embed=embed)
         elif isinstance(error, commands.MissingRequiredArgument):
-            embed = embed_base(f"{EMOJI_WARN} Missing Argument", "You are missing a required argument. Check the command syntax.", LOSS_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["warning"]} Missing Argument", "You are missing a required argument. Check the command syntax.", LOSS_COLOR, ctx)
             await ctx.send(embed=embed)
         elif isinstance(error, commands.CheckFailure):
-            embed = embed_base(f"{EMOJI_WRONG} Permission Denied", "You do not have permission to use this command.", LOSS_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["cross"]} Permission Denied", "You do not have permission to use this command.", LOSS_COLOR, ctx)
             await ctx.send(embed=embed)
         elif isinstance(error, commands.CommandOnCooldown):
             retry_after = error.retry_after
-            embed = embed_base(f"{COOLDOWN_EMOJI} Cooldown", f"Please wait {retry_after:.0f} seconds before using this command again.", LOSS_COLOR, ctx)
+            embed = embed_base(f"{EMOJIS["cooldown"]} Cooldown", f"Please wait {retry_after:.0f} seconds before using this command again.", LOSS_COLOR, ctx)
             await ctx.send(embed=embed, delete_after=5)
         else:
             print(f"Ignoring exception in command {ctx.command}: {error}", flush=True)
