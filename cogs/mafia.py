@@ -9,6 +9,8 @@ import discord
 from discord.ext import commands
 
 
+from utils.emoji import EMOJIS
+from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
 def _allowed_channel(ctx: commands.Context) -> bool:
     if not ctx.guild:
         return False
@@ -64,7 +66,7 @@ class MafiaGame:
         self.task: Optional[asyncio.Task] = None
 
 
-class LobbyView(discord.ui.View):
+class LobbyView(ComponentsV2View):
     def __init__(self, cog: "MafiaCog", game: MafiaGame):
         super().__init__(timeout=None)
         self.cog = cog
@@ -76,7 +78,8 @@ class LobbyView(discord.ui.View):
             custom_id="mafia_lobby:join",
         )
         join_btn.callback = self.join_callback
-        self.add_item(join_btn)
+        controls = discord.ui.ActionRow()
+        controls.add_item(join_btn)
 
         leave_btn = discord.ui.Button(
             label="LEAVE",
@@ -84,7 +87,7 @@ class LobbyView(discord.ui.View):
             custom_id="mafia_lobby:leave",
         )
         leave_btn.callback = self.leave_callback
-        self.add_item(leave_btn)
+        controls.add_item(leave_btn)
 
         start_btn = discord.ui.Button(
             label="START GAME",
@@ -92,7 +95,7 @@ class LobbyView(discord.ui.View):
             custom_id="mafia_lobby:start",
         )
         start_btn.callback = self.start_callback
-        self.add_item(start_btn)
+        controls.add_item(start_btn)
 
         cancel_btn = discord.ui.Button(
             label="CANCEL GAME",
@@ -100,7 +103,8 @@ class LobbyView(discord.ui.View):
             custom_id="mafia_lobby:cancel",
         )
         cancel_btn.callback = self.cancel_callback
-        self.add_item(cancel_btn)
+        controls.add_item(cancel_btn)
+        self.add_item(controls)
 
     async def join_callback(self, interaction: discord.Interaction):
         await self.cog._handle_join_button(interaction, self.game)
@@ -115,7 +119,7 @@ class LobbyView(discord.ui.View):
         await self.cog._handle_cancel_button(interaction, self.game)
 
 
-class NightActionView(discord.ui.View):
+class NightActionView(ComponentsV2View):
     def __init__(
         self,
         cog: "MafiaCog",
@@ -137,7 +141,9 @@ class NightActionView(discord.ui.View):
                 custom_id=f"mafia_night:{action_type}:{user_id}",
             )
             select.callback = self.select_callback
-            self.add_item(select)
+            row = discord.ui.ActionRow()
+            row.add_item(select)
+            self.add_item(row)
 
     def _build_options(self) -> List[discord.SelectOption]:
         options: List[discord.SelectOption] = []
@@ -159,11 +165,10 @@ class NightActionView(discord.ui.View):
         )
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        disable_all_components(self)
 
 
-class VoteView(discord.ui.View):
+class VoteView(ComponentsV2View):
     def __init__(self, cog: "MafiaCog", game: MafiaGame):
         super().__init__(timeout=game.settings["vote_duration"])
         self.cog = cog
@@ -183,14 +188,15 @@ class VoteView(discord.ui.View):
             custom_id="mafia_vote",
         )
         select.callback = self.vote_callback
-        self.add_item(select)
+        row = discord.ui.ActionRow()
+        row.add_item(select)
+        self.add_item(row)
 
     async def vote_callback(self, interaction: discord.Interaction):
         await self.cog._handle_vote_select(interaction, self.game)
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        disable_all_components(self)
 
 
 class MafiaCog(commands.Cog, name="Mafia"):
@@ -244,7 +250,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
 
     def _lobby_embed(self, game: MafiaGame) -> discord.Embed:
         embed = discord.Embed(
-            title="🔪 MAFIA",
+            title=f"{EMOJIS['knife']} MAFIA",
             description=f"Players: {len(game.players)}/{game.settings['max_players']}",
             color=discord.Color.red(),
         )
@@ -260,7 +266,8 @@ class MafiaCog(commands.Cog, name="Mafia"):
         if game.lobby_message is not None:
             try:
                 view = LobbyView(self, game)
-                await game.lobby_message.edit(embed=self._lobby_embed(game), view=view)
+                prepare_v2_view(view, self._lobby_embed(game))
+                await game.lobby_message.edit(view=view)
             except discord.HTTPException:
                 self._log(f"Failed to update lobby message | guild_id={game.guild_id}")
 
@@ -352,7 +359,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
     def _role_dm_embed(self, role: str, game: MafiaGame) -> discord.Embed:
         if role == "Mafia":
             embed = discord.Embed(
-                title="🔪 You are MAFIA.",
+                title=f"{EMOJIS['knife']} You are MAFIA.",
                 description=(
                     "Your objective:\n"
                     f"Reach {game.settings['mafia_kill_target']} successful Mafia kills.\n"
@@ -362,7 +369,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             )
         elif role == "Doctor":
             embed = discord.Embed(
-                title="🩺 You are the DOCTOR.",
+                title=f"{EMOJIS['doctor']} You are the DOCTOR.",
                 description=(
                     "You can save a player from a Mafia attack.\n"
                     f"You have {game.doctor_saves_remaining} saves for the entire game."
@@ -371,13 +378,13 @@ class MafiaCog(commands.Cog, name="Mafia"):
             )
         elif role == "Detective":
             embed = discord.Embed(
-                title="🕵️ You are the DETECTIVE.",
+                title=f"{EMOJIS['detective_unicode']} You are the DETECTIVE.",
                 description="You can investigate players and determine whether they are Mafia.",
                 color=discord.Color.blue(),
             )
         else:
             embed = discord.Embed(
-                title="👤 You are a CIVILIAN.",
+                title=f"{EMOJIS['user']} You are a CIVILIAN.",
                 description="Find and eliminate the Mafia.",
                 color=discord.Color.light_gray(),
             )
@@ -441,7 +448,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             self.bot.loop.create_task(
                 game.lobby_message.edit(
                     embed=discord.Embed(
-                        title="🔪 MAFIA",
+                        title=f"{EMOJIS['knife']} MAFIA",
                         description="Game starting...",
                         color=discord.Color.red(),
                     ),
@@ -473,7 +480,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             try:
                 channel = self.bot.get_channel(game.channel_id)
                 if channel:
-                    await channel.send("⚠️ An unexpected error occurred. The game has been ended.")
+                    await channel.send(f"{EMOJIS['warning']} An unexpected error occurred. The game has been ended.")
             except discord.HTTPException:
                 pass
             await self._end_game(game, "error")
@@ -489,7 +496,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             return
 
         embed = discord.Embed(
-            title="🌙 NIGHT PHASE",
+            title=f"{EMOJIS['night']} NIGHT PHASE",
             description=(
                 f"Night {game.round}. Submit your action privately.\n"
                 f"You have {game.settings['night_duration']} seconds."
@@ -545,12 +552,13 @@ class MafiaCog(commands.Cog, name="Mafia"):
             "detective": "Choose a player to investigate.",
         }
         embed = discord.Embed(
-            title="🌙 Night Action",
+            title=f"{EMOJIS['night']} Night Action",
             description=action_names.get(action_type, "Choose a player."),
             color=discord.Color.dark_blue(),
         )
         try:
-            message = await member.send(embed=embed, view=view)
+            prepare_v2_view(view, embed)
+            message = await member.send(view=view)
             game.night_view_messages.append(message)
         except discord.HTTPException:
             self._log(
@@ -672,7 +680,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             )
 
         embed = discord.Embed(
-            title="☀️ MORNING",
+            title=f"{EMOJIS['morning']} MORNING",
             color=discord.Color.gold(),
         )
         if killed_id is not None:
@@ -720,7 +728,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             f"{target_name} is Mafia." if is_mafia else f"{target_name} is NOT Mafia."
         )
         embed = discord.Embed(
-            title="🕵️ Investigation Result",
+            title=f"{EMOJIS['detective_unicode']} Investigation Result",
             description=result_text,
             color=discord.Color.blue(),
         )
@@ -740,7 +748,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             return
 
         embed = discord.Embed(
-            title="☀️ DAY PHASE",
+            title=f"{EMOJIS['morning']} DAY PHASE",
             description=(
                 f"Discuss who you think is Mafia.\n"
                 f"You have {game.settings['day_duration']} seconds to discuss."
@@ -763,7 +771,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
             return
 
         embed = discord.Embed(
-            title="🗳️ VOTING",
+            title=f"{EMOJIS['voting']} VOTING",
             description=(
                 f"Vote for who you think is Mafia.\n"
                 f"You have {game.settings['vote_duration']} seconds to vote."
@@ -771,7 +779,8 @@ class MafiaCog(commands.Cog, name="Mafia"):
             color=discord.Color.purple(),
         )
         view = VoteView(self, game)
-        message = await channel.send(embed=embed, view=view)
+        prepare_v2_view(view, embed)
+        message = await channel.send(view=view)
         game.vote_view_message = message
         view.message = message
         self._log(f"Voting opened | guild_id={game.guild_id}")
@@ -855,7 +864,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
                 if eliminated_id in game.alive_players:
                     self._kill_player(game, eliminated_id)
                     name = game.players.get(eliminated_id, str(eliminated_id))
-                    await channel.send(f"☠️ {name} was eliminated by vote.")
+                    await channel.send(f"{EMOJIS['coffin']} {name} was eliminated by vote.")
                     self._log(f"Player eliminated by vote | target_id={eliminated_id}")
 
         winner = self._check_win_condition(game)
@@ -895,8 +904,8 @@ class MafiaCog(commands.Cog, name="Mafia"):
         if channel is not None:
             if winner == "mafia":
                 embed = discord.Embed(
-                    title="🏆 GAME OVER",
-                    description="🔪 MAFIA WINS",
+                    title=f"{EMOJIS['game_trophy']} GAME OVER",
+                    description=f"{EMOJIS['knife']} MAFIA WINS",
                     color=discord.Color.red(),
                 )
                 embed.add_field(
@@ -905,8 +914,8 @@ class MafiaCog(commands.Cog, name="Mafia"):
                 )
             elif winner == "civilians":
                 embed = discord.Embed(
-                    title="🏆 GAME OVER",
-                    description="👥 CIVILIANS WIN",
+                    title=f"{EMOJIS['game_trophy']} GAME OVER",
+                    description=f"{EMOJIS['civilians']} CIVILIANS WIN",
                     color=discord.Color.green(),
                 )
                 embed.add_field(
@@ -915,13 +924,13 @@ class MafiaCog(commands.Cog, name="Mafia"):
                 )
             elif winner == "stopped":
                 embed = discord.Embed(
-                    title="🛑 GAME STOPPED",
+                    title=f"{EMOJIS['game_stop']} GAME STOPPED",
                     description="The game was stopped by staff.",
                     color=discord.Color.orange(),
                 )
             else:
                 embed = discord.Embed(
-                    title="⚠️ GAME ENDED",
+                    title=f"{EMOJIS['warning']} GAME ENDED",
                     description="The game has ended due to an error.",
                     color=discord.Color.orange(),
                 )
@@ -1038,7 +1047,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
                     member = ctx.guild.get_member(uid)
                     if member:
                         await ctx.send(
-                            f"⚠️ {member.mention}, I couldn't send your Mafia role through DM. "
+                            f"{EMOJIS['warning']} {member.mention}, I couldn't send your Mafia role through DM. "
                             "Please enable DMs from server members and try again.",
                             delete_after=60,
                         )
@@ -1250,7 +1259,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
                     member = interaction.guild.get_member(uid)
                     if member:
                         await interaction.followup.send(
-                            f"⚠️ {member.mention}, I couldn't send your Mafia role through DM. "
+                            f"{EMOJIS['warning']} {member.mention}, I couldn't send your Mafia role through DM. "
                             "Please enable DMs from server members and try again.",
                             ephemeral=True,
                         )
@@ -1266,7 +1275,7 @@ class MafiaCog(commands.Cog, name="Mafia"):
 
         await interaction.edit_original_response(
             embed=discord.Embed(
-                title="🔪 MAFIA",
+                title=f"{EMOJIS['knife']} MAFIA",
                 description="Game starting...",
                 color=discord.Color.red(),
             ),
