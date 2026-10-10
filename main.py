@@ -21,7 +21,7 @@ load_dotenv()
 console = Console()
 
 DEFAULT_CONFIG = {
-    "prefix": "*",
+    "prefix": "$",
     "owner_id": 1327528116079296594,
     "guild_id": 1535960575341756527,
     "allowed_channel_id": 1555408897013977150,
@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     "activity": "Watching over Nuvella",
     "activity_url": None,
     "sync_commands": True,
-    "application_id": 1511537834543153163,
+    "application_id": 1537342404099571762,
 }
 
 
