@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from utils.emoji import EMOJIS
 from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
+from utils.database import run_transaction
 logger = logging.getLogger(__name__)
 
 # Timezone: prefer stdlib zoneinfo (Py3.9+); fall back to pytz
@@ -498,6 +499,32 @@ class TimezoneModal(discord.ui.Modal):
         )
 
 
+def board_staff_only():
+    """Only the bot owner, server owner, configured Admin, or Senior Moderator."""
+    async def predicate(ctx):
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            raise commands.CheckFailure("This configuration is only available inside a server.")
+        cfg = getattr(ctx.bot, "config", {}) or {}
+        try:
+            if ctx.author.id == int(cfg.get("owner_id") or getattr(ctx.bot, "owner_id", 0) or 0) or ctx.author.id == ctx.guild.owner_id:
+                return True
+        except (TypeError, ValueError):
+            if ctx.author.id == ctx.guild.owner_id:
+                return True
+        if getattr(ctx.author.guild_permissions, "administrator", False):
+            return True
+        roles = cfg.get("roles", {}) or {}
+        allowed = set()
+        for key in ("admin_role_id", "senior_moderator_role_id"):
+            try:
+                if roles.get(key): allowed.add(int(roles[key]))
+            except (TypeError, ValueError): pass
+        if any(role.id in allowed for role in ctx.author.roles):
+            return True
+        raise commands.CheckFailure("Only Admins and Senior Moderators can configure skullboard.")
+    return commands.check(predicate)
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -539,6 +566,7 @@ class Moderation(commands.Cog):
 
         self.db = Database(bot)
         self.pool = self.db.pool
+        self._skull_locks = defaultdict(asyncio.Lock)
 
     # ---------------------------------------------------------------
     #  Live role-ID resolution (source of truth = bot.config)
@@ -712,6 +740,32 @@ class Moderation(commands.Cog):
         if not isinstance(error, commands.CommandOnCooldown):
             await self._log_error(ctx, error)
 
+        if isinstance(error, commands.BadArgument):
+            signature = getattr(ctx.command, "signature", "") or ""
+            usage = f"{ctx.clean_prefix}{ctx.command.qualified_name} {signature}".strip()
+            await self._send_temp_error(
+                ctx,
+                error_embed(
+                    ctx,
+                    f"{EMOJIS.get('cross', '❌')} Invalid Argument",
+                    f"One or more arguments have the wrong format. Check the command usage:\n`{usage}`",
+                ),
+            )
+            return
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            signature = getattr(ctx.command, "signature", "") or ""
+            usage = f"{ctx.clean_prefix}{ctx.command.qualified_name} {signature}".strip()
+            await self._send_temp_error(
+                ctx,
+                error_embed(
+                    ctx,
+                    f"{EMOJIS.get('warning', '⚠️')} Missing Argument",
+                    f"A required argument is missing. Usage: `{usage}`",
+                ),
+            )
+            return
+
         if isinstance(error, commands.UserInputError):
             return
 
@@ -860,6 +914,29 @@ class Moderation(commands.Cog):
                 old_nick TEXT, new_nick TEXT, timestamp BIGINT)""",
             "CREATE TABLE IF NOT EXISTS log_config (id SERIAL PRIMARY KEY, channel_id BIGINT)",
             "CREATE TABLE IF NOT EXISTS blacklist (user_id BIGINT PRIMARY KEY, reason TEXT)",
+            """CREATE TABLE IF NOT EXISTS rep_points (
+                guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
+                points BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS rep_cooldowns (
+                guild_id BIGINT NOT NULL, giver_id BIGINT NOT NULL,
+                last_used BIGINT NOT NULL,
+                PRIMARY KEY (guild_id, giver_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS skullboard_config (
+                guild_id BIGINT PRIMARY KEY,
+                board_channel_id BIGINT,
+                threshold INTEGER NOT NULL DEFAULT 5,
+                allowed_channels BIGINT[] NOT NULL DEFAULT '{}',
+                blocked_channels BIGINT[] NOT NULL DEFAULT '{}',
+                blocked_users BIGINT[] NOT NULL DEFAULT '{}'
+            )""",
+            """CREATE TABLE IF NOT EXISTS skullboard_posts (
+                guild_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
+                board_message_id BIGINT NOT NULL, posted_at BIGINT NOT NULL,
+                PRIMARY KEY (guild_id, message_id)
+            )""",
         ]
         for t in tables:
             await self.db.execute(t)
@@ -2771,7 +2848,6 @@ class Moderation(commands.Cog):
     async def _lock_channel(self, ctx, channel):
         guild = ctx.guild
         bot_member = guild.me
-
         if bot_member is None:
             return await self.fail(ctx, "I could not resolve my server member.")
         if not bot_member.guild_permissions.manage_channels:
@@ -2779,105 +2855,108 @@ class Moderation(commands.Cog):
         if not channel.permissions_for(bot_member).view_channel:
             return await self.fail(ctx, "I cannot access that channel.")
 
+        original = self._serialize_lock_overwrites(channel)
+        snapshot = {
+            "version": self.LOCK_SNAPSHOT_VERSION,
+            "guild_id": str(guild.id),
+            "channel_id": str(channel.id),
+            "locked_by": str(ctx.author.id),
+            "locked_at": int(time.time()),
+            "overwrites": original,
+        }
+        advisory_key = int(channel.id) & 0x7FFFFFFFFFFFFFFF
+        failure = None
+        lock_acquired = False
+
+        # Use a session advisory lock across the Discord API call, but do not
+        # keep a PostgreSQL transaction/row locks open while waiting on Discord.
         async with self.db.pool.acquire() as conn:
-            async with conn.transaction():
-                advisory_key = int(channel.id) & 0x7FFFFFFFFFFFFFFF
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", advisory_key)
-
-                existing = await conn.fetchrow("SELECT data FROM lockstate WHERE channel_id = $1", channel.id)
+            try:
+                await conn.execute("SELECT pg_advisory_lock($1::bigint)", advisory_key)
+                lock_acquired = True
+                existing = await conn.fetchrow(
+                    "SELECT data FROM lockstate WHERE channel_id=$1", channel.id)
                 if existing is not None:
-                    return await self.fail(ctx, f"{channel.mention} is already locked.")
-
-                original = self._serialize_lock_overwrites(channel)
-                snapshot = {
-                    "version": self.LOCK_SNAPSHOT_VERSION,
-                    "guild_id": str(guild.id),
-                    "channel_id": str(channel.id),
-                    "locked_by": str(ctx.author.id),
-                    "locked_at": int(time.time()),
-                    "overwrites": original,
-                }
-
-                new_overwrites = dict(channel.overwrites)
-                bypass_role_ids = self._get_lock_bypass_role_ids(guild)
-
-                roles_to_lock = {t for t in channel.overwrites if isinstance(t, discord.Role)}
-                roles_to_lock.add(guild.default_role)
-
-                for role in roles_to_lock:
-                    if role.permissions.administrator or role.id in bypass_role_ids:
-                        continue
-                    old = channel.overwrites_for(role)
-                    allow, deny = old.pair()
-                    locked = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
-                    locked.send_messages = False
-                    new_overwrites[role] = locked
-
-                for target in list(channel.overwrites):
-                    if not isinstance(target, discord.Member) or target.id == bot_member.id:
-                        continue
-                    old = channel.overwrites_for(target)
-                    allow, deny = old.pair()
-                    locked = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
-                    locked.send_messages = False
-                    new_overwrites[target] = locked
-
-                for role_id in bypass_role_ids:
-                    role = guild.get_role(role_id)
-                    if role is None or role.is_default():
-                        continue
-                    old = channel.overwrites_for(role)
-                    allow, deny = old.pair()
-                    bypass = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
-                    bypass.send_messages = True
-                    new_overwrites[role] = bypass
-
-                old_bot = channel.overwrites_for(bot_member)
-                allow, deny = old_bot.pair()
-                bot_ow = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
-                bot_ow.view_channel = True
-                bot_ow.send_messages = True
-                bot_ow.read_message_history = True
-                new_overwrites[bot_member] = bot_ow
-
-                try:
-                    await conn.execute(
-                        "INSERT INTO lockstate (channel_id, data) VALUES ($1, $2::jsonb)",
-                        channel.id, json.dumps(snapshot),
-                    )
-                except Exception:
-                    logger.exception("Failed to save lock snapshot for channel %s", channel.id)
-                    return await self.fail(ctx, "Failed to save the channel lock state.")
-
-                try:
-                    await channel.edit(
-                        overwrites=new_overwrites,
-                        reason=f"Locked by {ctx.author} ({ctx.author.id})",
-                    )
-                except discord.Forbidden:
+                    failure = f"{channel.mention} is already locked."
+                else:
                     try:
-                        await conn.execute("DELETE FROM lockstate WHERE channel_id = $1", channel.id)
+                        await conn.execute(
+                            "INSERT INTO lockstate (channel_id, data) VALUES ($1, $2::jsonb)",
+                            channel.id, json.dumps(snapshot),
+                        )
                     except Exception:
-                        logger.exception("Failed to remove failed lock snapshot for %s", channel.id)
-                    return await self.fail(ctx, "Discord rejected the lock.")
-                except discord.HTTPException as exc:
-                    logger.exception("HTTP error locking channel %s: %s", channel.id, exc)
-                    try:
-                        await conn.execute("DELETE FROM lockstate WHERE channel_id = $1", channel.id)
-                    except Exception:
-                        logger.exception("Failed to remove failed lock snapshot for %s", channel.id)
-                    return await self.fail(ctx, "Discord failed to apply the channel lock.")
-                except Exception:
-                    logger.exception("Unexpected lock failure for channel %s", channel.id)
-                    try:
-                        await conn.execute("DELETE FROM lockstate WHERE channel_id = $1", channel.id)
-                    except Exception:
-                        logger.exception("Failed to remove failed lock snapshot for %s", channel.id)
-                    return await self.fail(ctx, "Unexpected error while locking channel.")
+                        logger.exception("Failed to save lock snapshot for channel %s", channel.id)
+                        failure = "Failed to save the channel lock state."
 
+                    if failure is None:
+                        new_overwrites = dict(channel.overwrites)
+                        bypass_role_ids = self._get_lock_bypass_role_ids(guild)
+                        roles_to_lock = {target for target in channel.overwrites if isinstance(target, discord.Role)}
+                        roles_to_lock.add(guild.default_role)
+                        for role in roles_to_lock:
+                            if role.permissions.administrator or role.id in bypass_role_ids:
+                                continue
+                            old = channel.overwrites_for(role)
+                            allow, deny = old.pair()
+                            locked = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
+                            locked.send_messages = False
+                            new_overwrites[role] = locked
+                        for target in list(channel.overwrites):
+                            if not isinstance(target, discord.Member) or target.id == bot_member.id:
+                                continue
+                            old = channel.overwrites_for(target)
+                            allow, deny = old.pair()
+                            locked = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
+                            locked.send_messages = False
+                            new_overwrites[target] = locked
+                        for role_id in bypass_role_ids:
+                            role = guild.get_role(role_id)
+                            if role is None or role.is_default():
+                                continue
+                            old = channel.overwrites_for(role)
+                            allow, deny = old.pair()
+                            bypass = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
+                            bypass.send_messages = True
+                            new_overwrites[role] = bypass
+                        old_bot = channel.overwrites_for(bot_member)
+                        allow, deny = old_bot.pair()
+                        bot_ow = discord.PermissionOverwrite.from_pair(allow=allow, deny=deny)
+                        bot_ow.view_channel = True
+                        bot_ow.send_messages = True
+                        bot_ow.read_message_history = True
+                        new_overwrites[bot_member] = bot_ow
+
+                        try:
+                            await channel.edit(
+                                overwrites=new_overwrites,
+                                reason=f"Locked by {ctx.author} ({ctx.author.id})",
+                            )
+                        except discord.Forbidden:
+                            failure = "Discord rejected the lock."
+                            # Forbidden means the edit was rejected; remove the unused snapshot.
+                            try:
+                                await conn.execute("DELETE FROM lockstate WHERE channel_id=$1", channel.id)
+                            except Exception:
+                                logger.exception("Failed to clean rejected lock snapshot for channel %s", channel.id)
+                        except discord.HTTPException as exc:
+                            # The API outcome can be ambiguous on timeouts; keep the original
+                            # snapshot so a moderator can safely run unlock to restore it.
+                            logger.exception("HTTP error locking channel %s: %s", channel.id, exc)
+                            failure = "Discord did not confirm the lock. The saved restore state was kept; run unlock if needed."
+                        except Exception:
+                            logger.exception("Unexpected lock failure for channel %s", channel.id)
+                            failure = "The lock failed unexpectedly. The saved restore state was kept; run unlock if needed."
+            finally:
+                if lock_acquired:
+                    try:
+                        await conn.execute("SELECT pg_advisory_unlock($1::bigint)", advisory_key)
+                    except Exception:
+                        logger.exception("Could not release channel advisory lock | channel_id=%s", channel.id)
+
+        if failure:
+            return await self.fail(ctx, failure)
         await self.log_action(
-            ctx, "Channel Locked",
-            channel=channel,
+            ctx, "Channel Locked", channel=channel,
             extra=f"Overwrites snapshot saved (`{len(original)}` entries).",
         )
 
@@ -2892,81 +2971,92 @@ class Moderation(commands.Cog):
     async def _unlock_channel(self, ctx, channel):
         guild = ctx.guild
         bot_member = guild.me
-
         if bot_member is None:
             return await self.fail(ctx, "I could not resolve my server member.")
         if not bot_member.guild_permissions.manage_channels:
             return await self.fail(ctx, "I lack **Manage Channels** permission.")
 
+        advisory_key = int(channel.id) & 0x7FFFFFFFFFFFFFFF
+        failure = None
+        restored = []
+        stale = []
+        lock_acquired = False
         async with self.db.pool.acquire() as conn:
-            async with conn.transaction():
-                advisory_key = int(channel.id) & 0x7FFFFFFFFFFFFFFF
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", advisory_key)
-
-                row = await conn.fetchrow("SELECT data FROM lockstate WHERE channel_id = $1", channel.id)
+            try:
+                await conn.execute("SELECT pg_advisory_lock($1::bigint)", advisory_key)
+                lock_acquired = True
+                row = await conn.fetchrow("SELECT data FROM lockstate WHERE channel_id=$1", channel.id)
                 if row is None:
-                    return await self.fail(
-                        ctx,
+                    failure = (
                         f"{channel.mention} has no saved lock state. "
-                        "I will not guess which permissions belong to the lock.",
+                        "I will not guess which permissions belong to the lock."
                     )
-
-                try:
-                    data = self._decode_lockstate(row["data"])
-                except Exception:
-                    logger.exception("Corrupt lockstate for channel %s", channel.id)
-                    return await self.fail(ctx, "The saved lock state is corrupted.")
-
-                version = data.get("version")
-                if version is None:
-                    logger.warning("Legacy role-only lock snapshot detected for channel %s", channel.id)
-                    snapshot = self._legacy_snapshot_to_v2(data)
-                elif version != self.LOCK_SNAPSHOT_VERSION:
-                    return await self.fail(ctx, f"Unsupported lock snapshot version `{version}`.")
                 else:
-                    if str(data.get("guild_id")) != str(guild.id):
-                        return await self.fail(ctx, "The saved lock belongs to another server.")
-                    if str(data.get("channel_id")) != str(channel.id):
-                        return await self.fail(ctx, "The saved lock belongs to another channel.")
-                    snapshot = data.get("overwrites")
-                    if not isinstance(snapshot, list):
-                        return await self.fail(ctx, "The saved lock snapshot is malformed.")
+                    try:
+                        data = self._decode_lockstate(row["data"])
+                    except Exception:
+                        logger.exception("Corrupt lockstate for channel %s", channel.id)
+                        failure = "The saved lock state is corrupted."
 
-                restored, stale = self._deserialize_lock_overwrites(guild, snapshot)
+                    if failure is None:
+                        version = data.get("version")
+                        if version is None:
+                            logger.warning("Legacy role-only lock snapshot detected for channel %s", channel.id)
+                            snapshot = self._legacy_snapshot_to_v2(data)
+                        elif version != self.LOCK_SNAPSHOT_VERSION:
+                            failure = f"Unsupported lock snapshot version `{version}`."
+                            snapshot = None
+                        elif str(data.get("guild_id")) != str(guild.id):
+                            failure = "The saved lock belongs to another server."
+                            snapshot = None
+                        elif str(data.get("channel_id")) != str(channel.id):
+                            failure = "The saved lock belongs to another channel."
+                            snapshot = None
+                        else:
+                            snapshot = data.get("overwrites")
+                            if not isinstance(snapshot, list):
+                                failure = "The saved lock snapshot is malformed."
 
-                if stale:
-                    logger.warning(
-                        "Unlock for channel %s has %d stale snapshot targets: %s",
-                        channel.id, len(stale), ", ".join(stale[:20]),
-                    )
+                        if failure is None:
+                            restored, stale = self._deserialize_lock_overwrites(guild, snapshot)
+                            if stale:
+                                logger.warning(
+                                    "Unlock for channel %s has %d stale snapshot targets: %s",
+                                    channel.id, len(stale), ", ".join(stale[:20]),
+                                )
+                            try:
+                                await channel.edit(
+                                    overwrites=restored,
+                                    reason=f"Unlocked by {ctx.author} ({ctx.author.id})",
+                                )
+                            except discord.Forbidden:
+                                failure = "Discord rejected the unlock. The saved restore state was kept."
+                            except discord.HTTPException as exc:
+                                logger.exception("HTTP error unlocking channel %s: %s", channel.id, exc)
+                                failure = "Discord did not confirm the unlock. The saved restore state was kept."
+                            except Exception:
+                                logger.exception("Unexpected unlock failure for channel %s", channel.id)
+                                failure = "The unlock failed unexpectedly. The saved restore state was kept."
+                            if failure is None:
+                                try:
+                                    await conn.execute("DELETE FROM lockstate WHERE channel_id=$1", channel.id)
+                                except Exception:
+                                    logger.exception("Channel %s restored but lockstate cleanup failed", channel.id)
+                                    failure = (
+                                        "The channel was unlocked, but I could not remove the old database snapshot. "
+                                        "Please run unlock again."
+                                    )
+            finally:
+                if lock_acquired:
+                    try:
+                        await conn.execute("SELECT pg_advisory_unlock($1::bigint)", advisory_key)
+                    except Exception:
+                        logger.exception("Could not release channel advisory lock | channel_id=%s", channel.id)
 
-                try:
-                    await channel.edit(
-                        overwrites=restored,
-                        reason=f"Unlocked by {ctx.author} ({ctx.author.id})",
-                    )
-                except discord.Forbidden:
-                    return await self.fail(ctx, "Discord rejected the unlock.")
-                except discord.HTTPException as exc:
-                    logger.exception("HTTP error unlocking channel %s: %s", channel.id, exc)
-                    return await self.fail(ctx, "Discord failed to restore the channel permissions.")
-                except Exception:
-                    logger.exception("Unexpected unlock failure for channel %s", channel.id)
-                    return await self.fail(ctx, "Unexpected error while unlocking channel.")
-
-                try:
-                    await conn.execute("DELETE FROM lockstate WHERE channel_id = $1", channel.id)
-                except Exception:
-                    logger.exception("Channel %s restored but lockstate cleanup failed", channel.id)
-                    return await self.fail(
-                        ctx,
-                        "The channel was unlocked, but I could not remove the old "
-                        "database snapshot. Please run unlock again.",
-                    )
-
+        if failure:
+            return await self.fail(ctx, failure)
         await self.log_action(
-            ctx, "Channel Unlocked",
-            channel=channel,
+            ctx, "Channel Unlocked", channel=channel,
             extra=f"Restored `{len(restored)}` overwrite entries"
                   + (f" (`{len(stale)}` stale targets skipped)." if stale else "."),
         )
@@ -2992,24 +3082,23 @@ class Moderation(commands.Cog):
         if not ok:
             return await self.fail(ctx, err)
 
-        should_punish = False
-        new_count = 0
-        previous = 0
-        async with self.db.pool.acquire() as conn:
-            async with conn.transaction():
-                lock_key = ((ctx.guild.id << 22) ^ member.id) & 0x7FFFFFFFFFFFFFFF
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
-                previous = await conn.fetchval(
-                    "SELECT COUNT(*) FROM warnings WHERE guild_id = $1 AND user_id = $2 AND countable = TRUE",
-                    ctx.guild.id, member.id
-                )
-                await conn.execute(
-                    "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, timestamp, countable) "
-                    "VALUES ($1, $2, $3, $4, $5, TRUE)",
-                    ctx.guild.id, member.id, actor.id, reason, int(time.time())
-                )
-                new_count = previous + 1
-                should_punish = previous < self.warn_ban_threshold <= new_count
+        async def operation(conn):
+            lock_key = ((ctx.guild.id << 22) ^ member.id) & 0x7FFFFFFFFFFFFFFF
+            await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
+            previous = await conn.fetchval(
+                "SELECT COUNT(*) FROM warnings WHERE guild_id=$1 AND user_id=$2 AND countable=TRUE",
+                ctx.guild.id, member.id,
+            )
+            await conn.execute(
+                "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, timestamp, countable) "
+                "VALUES ($1, $2, $3, $4, $5, TRUE)",
+                ctx.guild.id, member.id, actor.id, reason, int(time.time()),
+            )
+            new_count = int(previous or 0) + 1
+            return int(previous or 0), new_count, int(previous or 0) < self.warn_ban_threshold <= new_count
+
+        previous, new_count, should_punish = await run_transaction(
+            self.db.pool, operation, label="moderation.warn")
 
         await self.send(ctx, make_embed(
             ctx, f"{EMOJIS['warning']} Warning Issued",
@@ -3127,6 +3216,8 @@ class Moderation(commands.Cog):
     @modstats_group.command(name="add")
     @require("admin")
     async def modstats_add(self, ctx, command_name: str, count: int, user: discord.Member = None):
+        if count <= 0:
+            return await self.fail(ctx, "Count must be greater than zero.")
         target = user or ctx.author
         uid = str(target.id)
         self.modstats.setdefault(uid, {})
@@ -3137,9 +3228,24 @@ class Moderation(commands.Cog):
             target.id, command_name, count
         )
 
+    @modstats_add.error
+    async def modstats_add_error(self, ctx, error):
+        root = error.original if isinstance(error, commands.CommandInvokeError) else error
+        if isinstance(root, commands.BadArgument):
+            return await self.send(
+                ctx,
+                make_embed(ctx, "Invalid count", f"Count must be a whole number. Usage: `{ctx.clean_prefix}modstats add <command> <count> [member]`", GREY_COLOR),
+            )
+        if isinstance(root, commands.MissingRequiredArgument):
+            return await self.send(ctx, make_embed(ctx, "Missing argument", f"Usage: `{ctx.clean_prefix}modstats add <command> <count> [member]`", GREY_COLOR))
+        await self._log_error(ctx, root)
+        raise root
+
     @modstats_group.command(name="remove")
     @require("admin")
     async def modstats_remove(self, ctx, command_name: str, count: int, user: discord.Member = None):
+        if count <= 0:
+            return await self.fail(ctx, "Count must be greater than zero.")
         target = user or ctx.author
         uid = str(target.id)
         if uid not in self.modstats or command_name not in self.modstats[uid]:
@@ -3153,6 +3259,16 @@ class Moderation(commands.Cog):
             "UPDATE modstats SET count = GREATEST(count - $3, 0) WHERE user_id = $1 AND command = $2",
             target.id, command_name, count
         )
+
+    @modstats_remove.error
+    async def modstats_remove_error(self, ctx, error):
+        root = error.original if isinstance(error, commands.CommandInvokeError) else error
+        if isinstance(root, commands.BadArgument):
+            return await self.send(ctx, make_embed(ctx, "Invalid count", f"Count must be a whole number. Usage: `{ctx.clean_prefix}modstats remove <command> <count> [member]`", GREY_COLOR))
+        if isinstance(root, commands.MissingRequiredArgument):
+            return await self.send(ctx, make_embed(ctx, "Missing argument", f"Usage: `{ctx.clean_prefix}modstats remove <command> <count> [member]`", GREY_COLOR))
+        await self._log_error(ctx, root)
+        raise root
 
     @modstats_group.command(name="user")
     @require("admin")
@@ -4895,6 +5011,353 @@ class Moderation(commands.Cog):
             if self.current_page < len(self.pages) - 1:
                 self.current_page += 1
             await self._update(interaction)
+
+
+    # ---------------------------------------------------------------
+    # Reputation points (one point per giver every 24 hours)
+    # ---------------------------------------------------------------
+    @commands.command(name="rep")
+    async def rep_point(self, ctx, member: discord.Member):
+        if not ctx.guild:
+            return await ctx.reply("Reputation can only be given inside a server.", delete_after=8)
+        if member.bot or member.id == ctx.author.id:
+            return await ctx.reply("You cannot give a reputation point to yourself or a bot.", delete_after=8)
+        now = int(time.time())
+
+        async def operation(conn):
+            await conn.execute(
+                "INSERT INTO rep_cooldowns (guild_id,giver_id,last_used) VALUES ($1,$2,0) "
+                "ON CONFLICT DO NOTHING", ctx.guild.id, ctx.author.id)
+            previous = await conn.fetchval(
+                "SELECT last_used FROM rep_cooldowns WHERE guild_id=$1 AND giver_id=$2 FOR UPDATE",
+                ctx.guild.id, ctx.author.id)
+            if previous and now - int(previous) < 86400:
+                return {"remaining": 86400 - (now - int(previous)), "points": None}
+            await conn.execute(
+                "UPDATE rep_cooldowns SET last_used=$1 WHERE guild_id=$2 AND giver_id=$3",
+                now, ctx.guild.id, ctx.author.id)
+            points = await conn.fetchval(
+                "INSERT INTO rep_points (guild_id,user_id,points) VALUES ($1,$2,1) "
+                "ON CONFLICT (guild_id,user_id) DO UPDATE SET points=rep_points.points+1 RETURNING points",
+                ctx.guild.id, member.id)
+            return {"remaining": None, "points": points}
+
+        result = await run_transaction(self.bot.pool, operation, label="moderation.rep_point")
+        remaining, points = result["remaining"], result["points"]
+        if remaining is not None:
+            return await ctx.reply(
+                f"You can give reputation again in **{remaining // 3600}h {(remaining % 3600) // 60}m**.",
+                delete_after=10)
+        embed = discord.Embed(title="⭐ Reputation Added",
+                              description=f"{ctx.author.mention} gave {member.mention} **+1 rep**.\n\n"
+                                          f"**{member.display_name}** now has **{points}** rep point(s).",
+                              color=GREY_COLOR, timestamp=discord.utils.utcnow())
+        embed.set_footer(text="Each member can give one reputation point every 24 hours.")
+        await ctx.send(view=ComponentsV2View(timeout=120, embed=embed), allowed_mentions=discord.AllowedMentions(users=[ctx.author, member]))
+
+    @commands.command(name="repboard", aliases=["repleaderboard", "reps"])
+    async def rep_board(self, ctx):
+        if not ctx.guild:
+            return await ctx.reply("The reputation leaderboard is server-only.", delete_after=8)
+        rows = await self.bot.pool.fetch(
+            "SELECT user_id,points FROM rep_points WHERE guild_id=$1 AND points>0 ORDER BY points DESC,user_id ASC LIMIT 20",
+            ctx.guild.id)
+        lines = []
+        for rank, row in enumerate(rows, start=1):
+            member = ctx.guild.get_member(int(row["user_id"]))
+            label = discord.utils.escape_markdown(member.display_name) if member else f"Unknown user ({row['user_id']})"
+            lines.append(f"**{rank}.** {label} — **{int(row['points'])}** rep")
+        embed = discord.Embed(title="⭐ Reputation Leaderboard",
+                              description="\n".join(lines) if lines else "No reputation points yet. Use `$rep @member` to give someone a point.",
+                              color=GREY_COLOR, timestamp=discord.utils.utcnow())
+        await ctx.send(view=ComponentsV2View(timeout=120, embed=embed))
+
+    # ---------------------------------------------------------------
+    # Skullboard configuration and reaction tracking
+    # ---------------------------------------------------------------
+    async def _skull_config(self, guild_id: int):
+        await self.bot.pool.execute(
+            "INSERT INTO skullboard_config (guild_id) VALUES ($1) ON CONFLICT DO NOTHING", guild_id)
+        return await self.bot.pool.fetchrow("SELECT * FROM skullboard_config WHERE guild_id=$1", guild_id)
+
+    async def _set_skull_config(self, guild_id: int, field: str, value):
+        allowed_fields = {"board_channel_id", "threshold", "allowed_channels", "blocked_channels", "blocked_users"}
+        if field not in allowed_fields:
+            raise ValueError("Unsupported skullboard setting")
+        # field is selected only from the allow-list above; value is parameterized.
+        await self.bot.pool.execute(
+            f"UPDATE skullboard_config SET {field}=$1 WHERE guild_id=$2", value, guild_id)
+
+    @commands.group(name="skullboard", invoke_without_command=True)
+    @board_staff_only()
+    async def skullboard(self, ctx):
+        row = await self._skull_config(ctx.guild.id)
+        channel = ctx.guild.get_channel(int(row["board_channel_id"])) if row["board_channel_id"] else None
+        view = SkullboardConfigView(self, ctx.author.id, ctx.guild.id, int(row["threshold"]))
+        embed = discord.Embed(
+            title="💀 Skullboard Configuration",
+            description=(f"**Board channel:** {channel.mention if channel else 'Not set'}\n"
+                         f"**Skulls required:** {row['threshold']}\n"
+                         f"**Allowed channels:** {len(row['allowed_channels'] or []) or 'All except blocked'}\n"
+                         f"**Blocked channels:** {len(row['blocked_channels'] or [])}\n"
+                         f"**Blocked users:** {len(row['blocked_users'] or [])}\n\n"
+                         "Use the buttons to change the threshold or set the board channel to this channel. "
+                         "Subcommands manage allow/block lists."),
+            color=GREY_COLOR, timestamp=discord.utils.utcnow())
+        embed.set_footer(text="Admin / Senior Moderator only")
+        # Build an interactive Components V2 panel.
+        panel = ComponentsV2View(timeout=180, embed=embed)
+        panel.add_text("Use the interactive controls below to update the threshold or select the current channel as the board.")
+        panel.add_item(view.action_row())
+        panel.add_item(view.channel_row())
+        await ctx.send(view=panel)
+
+    @skullboard.command(name="channel")
+    @board_staff_only()
+    async def skullboard_channel(self, ctx, channel: discord.TextChannel):
+        await self._skull_config(ctx.guild.id)
+        await self._set_skull_config(ctx.guild.id, "board_channel_id", channel.id)
+        await ctx.reply(f"✅ Skullboard posts will go to {channel.mention}.")
+
+    @skullboard.command(name="threshold")
+    @board_staff_only()
+    async def skullboard_threshold(self, ctx, amount: int):
+        if not 1 <= amount <= 100:
+            return await ctx.reply("Threshold must be between 1 and 100 skull reactions.", delete_after=8)
+        await self._skull_config(ctx.guild.id)
+        await self._set_skull_config(ctx.guild.id, "threshold", amount)
+        await ctx.reply(f"✅ Skullboard threshold set to **{amount}**.")
+
+    @skullboard.command(name="allow")
+    @board_staff_only()
+    async def skullboard_allow(self, ctx, channel: discord.TextChannel):
+        row = await self._skull_config(ctx.guild.id)
+        blocked = list(row["blocked_channels"] or [])
+        allowed = set(int(x) for x in (row["allowed_channels"] or []))
+        if channel.id in blocked: blocked.remove(channel.id)
+        allowed.add(channel.id)
+        await self._set_skull_config(ctx.guild.id, "blocked_channels", blocked)
+        await self._set_skull_config(ctx.guild.id, "allowed_channels", sorted(allowed))
+        await ctx.reply(f"✅ {channel.mention} is allowed for skullboard.")
+
+    @skullboard.command(name="block")
+    @board_staff_only()
+    async def skullboard_block(self, ctx, channel: discord.TextChannel):
+        row = await self._skull_config(ctx.guild.id)
+        blocked = set(int(x) for x in (row["blocked_channels"] or []))
+        allowed = set(int(x) for x in (row["allowed_channels"] or []))
+        blocked.add(channel.id); allowed.discard(channel.id)
+        await self._set_skull_config(ctx.guild.id, "blocked_channels", sorted(blocked))
+        await self._set_skull_config(ctx.guild.id, "allowed_channels", sorted(allowed))
+        await ctx.reply(f"✅ {channel.mention} is blocked from skullboard.")
+
+    @skullboard.command(name="userblock")
+    @board_staff_only()
+    async def skullboard_user_block(self, ctx, member: discord.Member):
+        row = await self._skull_config(ctx.guild.id)
+        blocked = set(int(x) for x in (row["blocked_users"] or [])); blocked.add(member.id)
+        await self._set_skull_config(ctx.guild.id, "blocked_users", sorted(blocked))
+        await ctx.reply(f"✅ {member.mention} is now excluded from skullboard authors and reaction counts.")
+
+    @skullboard.command(name="userunblock")
+    @board_staff_only()
+    async def skullboard_user_unblock(self, ctx, member: discord.Member):
+        row = await self._skull_config(ctx.guild.id)
+        blocked = set(int(x) for x in (row["blocked_users"] or [])); blocked.discard(member.id)
+        await self._set_skull_config(ctx.guild.id, "blocked_users", sorted(blocked))
+        await ctx.reply(f"✅ {member.mention} can now be counted by skullboard.")
+
+    @skullboard.command(name="resetallow")
+    @board_staff_only()
+    async def skullboard_reset_allow(self, ctx):
+        await self._skull_config(ctx.guild.id)
+        await self._set_skull_config(ctx.guild.id, "allowed_channels", [])
+        await ctx.reply("✅ Skullboard is now allowed in all channels except explicitly blocked ones.")
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if not payload.guild_id or not payload.channel_id or not payload.message_id:
+            return
+        if self.bot.user and payload.user_id == self.bot.user.id:
+            return
+        emoji_obj = payload.emoji
+        emoji_name = (getattr(emoji_obj, "name", None) or str(emoji_obj)).casefold()
+        if emoji_name != "💀" and "skull" not in emoji_name:
+            return
+        lock = self._skull_locks[payload.message_id]
+        async with lock:
+            existing = await self.bot.pool.fetchrow(
+                "SELECT board_message_id FROM skullboard_posts WHERE guild_id=$1 AND message_id=$2",
+                payload.guild_id, payload.message_id)
+            if existing:
+                return
+            cfg = await self._skull_config(payload.guild_id)
+            board_channel_id = cfg["board_channel_id"]
+            if not board_channel_id:
+                return
+            blocked_channels = {int(x) for x in (cfg["blocked_channels"] or [])}
+            allowed_channels = {int(x) for x in (cfg["allowed_channels"] or [])}
+            blocked_users = {int(x) for x in (cfg["blocked_users"] or [])}
+            if payload.channel_id in blocked_channels or (allowed_channels and payload.channel_id not in allowed_channels):
+                return
+            guild = self.bot.get_guild(payload.guild_id)
+            if not guild:
+                return
+            channel = guild.get_channel(payload.channel_id)
+            board = guild.get_channel(int(board_channel_id))
+            if not isinstance(channel, discord.TextChannel) or not isinstance(board, discord.TextChannel):
+                return
+            try:
+                message = await channel.fetch_message(payload.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+            if message.author.bot or message.author.id in blocked_users:
+                return
+            reaction = next((r for r in message.reactions if (getattr(r.emoji, "name", None) or str(r.emoji)).casefold() == emoji_name), None)
+            if reaction is None:
+                return
+            reaction_users = set()
+            try:
+                async for user in reaction.users(limit=None):
+                    if user.bot or user.id in blocked_users:
+                        continue
+                    reaction_users.add(user.id)
+            except (discord.Forbidden, discord.HTTPException):
+                return
+            if len(reaction_users) < int(cfg["threshold"]):
+                return
+            content = message.content or "*(No text content)*"
+            if len(content) > 3900:
+                content = content[:3897] + "…"
+
+            ts = int(message.created_at.timestamp())
+
+            embed = discord.Embed(
+                title="💀 Hall of Shame",
+                color=GREY_COLOR,
+                timestamp=message.created_at,
+            )
+            embed.set_author(
+                name=f"{message.author.display_name}",
+                icon_url=message.author.display_avatar.url,
+            )
+            embed.add_field(
+                name="User",
+                value=f"{message.author.mention} (`{message.author.id}`)",
+                inline=False,
+            )
+            embed.add_field(
+                name="Channel",
+                value=channel.mention,
+                inline=False,
+            )
+            embed.add_field(
+                name="Message",
+                value=content,
+                inline=False,
+            )
+            if message.attachments:
+                first_img = next(
+                    (a for a in message.attachments if (a.content_type or "").startswith("image/")),
+                    None,
+                )
+                if first_img:
+                    embed.set_image(url=first_img.url)
+                urls = [
+                    f"[{discord.utils.escape_markdown(a.filename)}]({a.url})"
+                    for a in message.attachments
+                ]
+                embed.add_field(name="Attachments", value="\n".join(urls)[:1024], inline=False)
+            embed.add_field(
+                name="Message Link",
+                value=f"[Jump to message]({message.jump_url})",
+                inline=False,
+            )
+            embed.add_field(
+                name="Timestamp",
+                value=f"<t:{ts}:F> • <t:{ts}:R>",
+                inline=False,
+            )
+            try:
+                post = await board.send(view=ComponentsV2View(timeout=120, embed=embed), allowed_mentions=discord.AllowedMentions.none())
+                await self.bot.pool.execute(
+                    "INSERT INTO skullboard_posts (guild_id,message_id,board_message_id,posted_at) VALUES ($1,$2,$3,$4) ON CONFLICT (guild_id,message_id) DO NOTHING",
+                    payload.guild_id, payload.message_id, post.id, int(time.time()))
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Could not publish skullboard entry for message %s", message.id)
+
+
+class SkullboardConfigView:
+    """Button controls embedded in a Components V2 view; user/guild scoped."""
+    def __init__(self, cog: Moderation, author_id: int, guild_id: int, threshold: int):
+        self.cog = cog
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.threshold = threshold
+
+    def _button(self, label, style, callback, custom_id):
+        item = discord.ui.Button(label=label, style=style, custom_id=custom_id)
+        async def wrapped(interaction):
+            if interaction.user.id != self.author_id:
+                return await interaction.response.send_message("This config panel belongs to another moderator.", ephemeral=True)
+            # Re-check role permissions on every click; removing staff roles invalidates the panel.
+            if not await _skull_interaction_allowed(interaction, self.cog.bot):
+                return await interaction.response.send_message("Only Admins and Senior Moderators can configure skullboard.", ephemeral=True)
+            await callback(interaction)
+        item.callback = wrapped
+        return item
+
+    def action_row(self):
+        row = discord.ui.ActionRow()
+        async def change(interaction, delta):
+            cfg = await self.cog._skull_config(self.guild_id)
+            new_value = max(1, min(100, int(cfg["threshold"]) + delta))
+            await self.cog._set_skull_config(self.guild_id, "threshold", new_value)
+            self.threshold = new_value
+            await interaction.response.send_message(f"Skull threshold updated to **{new_value}**.", ephemeral=True)
+        row.add_item(self._button("− Skull", discord.ButtonStyle.secondary, lambda i: change(i, -1), f"skull:threshold:minus:{self.guild_id}:{self.author_id}"))
+        row.add_item(self._button("+ Skull", discord.ButtonStyle.secondary, lambda i: change(i, 1), f"skull:threshold:plus:{self.guild_id}:{self.author_id}"))
+        return row
+
+    def channel_row(self):
+        row = discord.ui.ActionRow()
+        async def set_here(interaction):
+            channel = interaction.channel
+            if not isinstance(channel, discord.TextChannel):
+                return await interaction.response.send_message("Run this panel in a text channel.", ephemeral=True)
+            await self.cog._skull_config(self.guild_id)
+            await self.cog._set_skull_config(self.guild_id, "board_channel_id", channel.id)
+            await interaction.response.send_message(f"Skullboard post channel set to {channel.mention}.", ephemeral=True)
+        async def allow_here(interaction):
+            cfg = await self.cog._skull_config(self.guild_id)
+            allowed = set(int(x) for x in (cfg["allowed_channels"] or [])); allowed.add(interaction.channel_id)
+            blocked = set(int(x) for x in (cfg["blocked_channels"] or [])); blocked.discard(interaction.channel_id)
+            await self.cog._set_skull_config(self.guild_id, "allowed_channels", sorted(allowed))
+            await self.cog._set_skull_config(self.guild_id, "blocked_channels", sorted(blocked))
+            await interaction.response.send_message("This channel is now allowed for skullboard.", ephemeral=True)
+        row.add_item(self._button("Set Board to This Channel", discord.ButtonStyle.primary, set_here, f"skull:channel:set:{self.guild_id}:{self.author_id}"))
+        row.add_item(self._button("Allow This Channel", discord.ButtonStyle.success, allow_here, f"skull:channel:allow:{self.guild_id}:{self.author_id}"))
+        return row
+
+
+async def _skull_interaction_allowed(interaction: discord.Interaction, bot) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return False
+    cfg = getattr(bot, "config", {}) or {}
+    try:
+        if interaction.user.id == int(cfg.get("owner_id") or getattr(bot, "owner_id", 0) or 0) or interaction.user.id == interaction.guild.owner_id:
+            return True
+    except (TypeError, ValueError):
+        if interaction.user.id == interaction.guild.owner_id: return True
+    if getattr(interaction.user.guild_permissions, "administrator", False):
+        return True
+    roles = cfg.get("roles", {}) or {}
+    ids = set()
+    for key in ("admin_role_id", "senior_moderator_role_id"):
+        try:
+            if roles.get(key): ids.add(int(roles[key]))
+        except (TypeError, ValueError): pass
+    return any(role.id in ids for role in interaction.user.roles)
 
 
 # ---------------------------------------------------------------
