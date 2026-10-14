@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import datetime
+from pathlib import Path
 import aiohttp
 import asyncpg
 from collections import defaultdict, deque
@@ -16,7 +17,18 @@ from rich.panel import Panel
 from rich.table import Table
 
 from utils.emoji import EMOJIS
-load_dotenv()
+from utils.components import ComponentsV2View
+from utils.logging_setup import setup_logging
+import logging
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+# Windows Task Scheduler often starts with C:\Windows\System32 as the working
+# directory unless "Start in" is set. Anchor configs/data/logs/.env to this project.
+os.chdir(PROJECT_ROOT)
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+LOG_DIR = setup_logging()
+logger = logging.getLogger("nuvella")
+command_logger = logging.getLogger("nuvella.commands")
 
 console = Console()
 
@@ -42,9 +54,8 @@ def load_bot_config():
             with open("config.json", "r") as f:
                 file_config = json.load(f)
                 config.update(file_config)
-        except Exception as e:
-            console.print_exception(show_locals=True)
-            console.print("[yellow]Warning: Failed to load config.json, using defaults/environment variables.[/yellow]")
+        except Exception:
+            logger.exception("Failed to load config.json; using defaults and environment variables")
 
     if os.getenv("PREFIX"):
         config["prefix"] = os.getenv("PREFIX")
@@ -83,7 +94,7 @@ def load_bot_config():
                 try:
                     staff_ids.append(int(roles[key]))
                 except (ValueError, TypeError) as e:
-                    console.print(f"[yellow]Invalid role ID for '{key}': {roles[key]} (skipped)[/yellow]")
+                    logger.warning("Invalid role ID for config key %s; skipping value", key)
         config["staff_role_ids"] = staff_ids
 
     return config
@@ -152,9 +163,8 @@ def is_staff(member: discord.Member) -> bool:
     try:
         with open(staff_file) as handle:
             staff_data = json.load(handle)
-    except Exception as e:
-        console.print_exception(show_locals=True)
-        console.print("[red]Failed to read data/staff.json[/red]")
+    except Exception:
+        logger.exception("Failed to read data/staff.json")
         return False
 
     uid = str(member.id)
@@ -186,9 +196,8 @@ def load_np_users():
         with open(path, "r") as f:
             data = json.load(f)
         return {int(uid) for uid in data.get("users", [])}
-    except Exception as e:
-        console.print_exception(show_locals=True)
-        console.print("[red]Failed to load np_users.json, returning empty set.[/red]")
+    except Exception:
+        logger.exception("Failed to load data/np_users.json; returning an empty set")
         return set()
 
 
@@ -201,9 +210,8 @@ def save_np_users(users_set):
         with open(path, "w") as f:
             json.dump({"users": sorted(list(users_set))}, f, indent=2)
         return True
-    except Exception as e:
-        console.print_exception(show_locals=True)
-        console.print("[red]Failed to save np_users.json[/red]")
+    except Exception:
+        logger.exception("Failed to save data/np_users.json")
         return False
 
 
@@ -222,10 +230,29 @@ def error_embed(ctx, title, desc):
     return embed
 
 
+def cog_has_custom_error_handler(cog) -> bool:
+    """Whether this cog overrides discord.py's default no-op command error handler."""
+    if cog is None:
+        return False
+    handler = getattr(type(cog), "cog_command_error", None)
+    base_handler = getattr(commands.Cog, "cog_command_error", None)
+    return handler is not None and handler is not base_handler
+
+
 class NuvellaCommandTree(app_commands.CommandTree):
     """Application-command checks shared by all registered slash commands."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command = getattr(interaction, "command", None)
+        command_name = getattr(command, "qualified_name", None) or getattr(command, "name", "unknown")
+        command_logger.info(
+            "START | type=slash | user_id=%s | guild_id=%s | channel_id=%s | command=%s",
+            getattr(interaction.user, "id", None),
+            getattr(interaction.guild, "id", None),
+            getattr(interaction, "channel_id", None),
+            command_name,
+        )
+
         async def deny(title: str, description: str) -> bool:
             embed = error_embed(interaction, title, description)
             try:
@@ -264,16 +291,16 @@ class NuvellaCommandTree(app_commands.CommandTree):
                         user.id, "Auto-blacklisted for command spam",
                     )
                 attempts.clear()
-            except Exception as exc:
-                console.print(f"[red]Failed to apply slash-command spam blacklist: {exc}[/red]")
+            except Exception:
+                logger.exception("Failed to apply slash-command spam blacklist | user_id=%s", user.id)
                 return await deny("Unavailable", "The bot could not verify your request. Please try again later.")
             return await deny("Blacklisted", "You have been blacklisted for spamming commands.")
 
         try:
             if await self.client.is_blacklisted(user.id):
                 return await deny("Blacklisted", "You are blacklisted from using the bot.")
-        except Exception as exc:
-            console.print(f"[red]Failed to check slash-command blacklist: {exc}[/red]")
+        except Exception:
+            logger.exception("Failed to check slash-command blacklist | user_id=%s", user.id)
             return await deny("Unavailable", "The bot could not verify your request. Please try again later.")
 
         last_used = _cooldowns.get(user.id)
@@ -283,6 +310,29 @@ class NuvellaCommandTree(app_commands.CommandTree):
 
         _cooldowns[user.id] = now
         return True
+
+    async def on_error(
+        self, interaction: discord.Interaction, command: app_commands.Command, error: Exception
+    ) -> None:
+        """Central traceback logging for unhandled slash-command failures."""
+        root_error = error.original if isinstance(error, app_commands.AppCommandError) and getattr(error, "original", None) else error
+        command_name = getattr(command, "qualified_name", None) or getattr(command, "name", "unknown")
+        logger.error(
+            "Slash command failed | user_id=%s | guild_id=%s | channel_id=%s | command=%s | error_type=%s | error=%s",
+            getattr(interaction.user, "id", None),
+            getattr(interaction.guild, "id", None),
+            getattr(interaction, "channel_id", None),
+            command_name, type(root_error).__name__, root_error,
+            exc_info=(type(root_error), root_error, root_error.__traceback__),
+        )
+        try:
+            message = "The command failed unexpectedly. The error has been logged; please try again later."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            logger.debug("Could not send slash-command failure notice", exc_info=True)
 
 
 def build_command_candidates(bot: commands.Bot):
@@ -316,7 +366,35 @@ def build_command_candidates(bot: commands.Bot):
     return sorted(candidates, key=len, reverse=True)
 
 
+class ComponentContext(commands.Context):
+    """Render embed-only prefix replies through the shared Components V2 layout.
+
+    Existing interactive messages that already have a View keep their original
+    layout so buttons/selects and message-edit flows are not broken.
+    """
+    async def send(self, content=None, *, embed=None, embeds=None, view=None, **kwargs):
+        target_embed = embed
+        if target_embed is None and embeds and len(embeds) == 1:
+            target_embed = embeds[0]
+        if view is None and target_embed is not None:
+            component_view = ComponentsV2View(timeout=180, embed=target_embed)
+            if content:
+                component_view.add_text(str(content))
+            return await super().send(None, view=component_view, **kwargs)
+
+        send_kwargs = dict(kwargs)
+        if embed is not None:
+            send_kwargs["embed"] = embed
+        if embeds is not None:
+            send_kwargs["embeds"] = embeds
+        if view is not None:
+            send_kwargs["view"] = view
+        return await super().send(content, **send_kwargs)
+
+
 class Nuvella(commands.Bot):
+    context_class = ComponentContext
+
     def __init__(self):
         super().__init__(
             command_prefix=PREFIX,
@@ -364,6 +442,10 @@ class Nuvella(commands.Bot):
                     xp BIGINT NOT NULL DEFAULT 0
                 )
             """)
+            # Add legacy-missing wallet/bank columns before touching them.
+            # CREATE TABLE IF NOT EXISTS alone cannot upgrade an older users table.
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet BIGINT DEFAULT 0")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bank BIGINT DEFAULT 0")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS xp BIGINT DEFAULT 0")
             await conn.execute("UPDATE users SET wallet = 0 WHERE wallet IS NULL")
             await conn.execute("UPDATE users SET bank = 0 WHERE bank IS NULL")
@@ -377,7 +459,13 @@ class Nuvella(commands.Bot):
 
         for file in sorted(os.listdir("./cogs")):
             if file.endswith(".py") and not file.startswith("_"):
-                await self.load_extension(f"cogs.{file[:-3]}")
+                extension = f"cogs.{file[:-3]}"
+                try:
+                    await self.load_extension(extension)
+                    logger.info("Cog loaded: %s", extension)
+                except Exception:
+                    logger.exception("Cog load failed: %s", extension)
+                    raise
 
         if config.get("sync_commands", False):
             # Only giveaway.py should publish slash commands. Remove every other
@@ -410,6 +498,7 @@ class Nuvella(commands.Bot):
 
     async def on_ready(self):
         self.uptime = time.time()
+        logger.info("Gateway ready as %s (%s)", self.user, self.user.id if self.user else "unknown")
         activity_name = config.get("activity", "Nuvella")
         activity_url = config.get("activity_url")
         if activity_url:
@@ -434,6 +523,111 @@ class Nuvella(commands.Bot):
             table.add_row("Issues", "\n".join(STARTUP_ISSUES) if STARTUP_ISSUES else "None")
 
             console.print(Panel(table, title="Nuvella Online", border_style="magenta", expand=False))
+            logger.info(
+                "Startup complete | cogs=%s | slash_synced=%s | startup_seconds=%.2f | latency_ms=%s | issues=%s",
+                len(self.cogs), self.synced_commands, elapsed, latency_ms,
+                "; ".join(STARTUP_ISSUES) if STARTUP_ISSUES else "none",
+            )
+
+    async def on_command(self, ctx):
+        try:
+            command_logger.info(
+                "START | user_id=%s | guild_id=%s | channel_id=%s | command=%s | args=%s",
+                getattr(ctx.author, "id", None), getattr(ctx.guild, "id", None),
+                getattr(ctx.channel, "id", None),
+                getattr(ctx.command, "qualified_name", "unknown"),
+                (ctx.message.content or "")[:1000],
+            )
+        except Exception:
+            logger.exception("Could not audit command start")
+
+    async def on_command_completion(self, ctx):
+        command_logger.info(
+            "SUCCESS | user_id=%s | guild_id=%s | channel_id=%s | command=%s",
+            getattr(ctx.author, "id", None), getattr(ctx.guild, "id", None),
+            getattr(ctx.channel, "id", None), getattr(ctx.command, "qualified_name", "unknown"),
+        )
+
+    async def on_command_error(self, ctx, error):
+        # User mistakes are logged as warnings, not stack traces. Runtime failures
+        # retain full tracebacks in logs/errors.log for diagnosis.
+        if isinstance(error, commands.CommandNotFound):
+            command_logger.info(
+                "UNKNOWN | user_id=%s | guild_id=%s | channel_id=%s | content=%s",
+                getattr(ctx.author, "id", None), getattr(ctx.guild, "id", None),
+                getattr(ctx.channel, "id", None), (ctx.message.content or "")[:500],
+            )
+            return
+
+        root_error = error.original if isinstance(error, commands.CommandInvokeError) else error
+        user_id = getattr(ctx.author, "id", None)
+        command_name = getattr(ctx.command, "qualified_name", "unknown")
+
+        # These are ordinary user-facing denials, not bot faults. Cog-level
+        # handlers may already have replied; never produce a duplicate response.
+        expected_denials = (
+            commands.CheckFailure,
+            commands.CommandOnCooldown,
+            commands.DisabledCommand,
+            commands.NoPrivateMessage,
+            commands.NotOwner,
+            commands.MissingPermissions,
+            commands.BotMissingPermissions,
+            commands.MaxConcurrencyReached,
+        )
+        if isinstance(root_error, expected_denials):
+            command_logger.info(
+                "DENIED | user_id=%s | guild_id=%s | channel_id=%s | command=%s | reason=%s",
+                user_id, getattr(ctx.guild, "id", None),
+                getattr(ctx.channel, "id", None), command_name,
+                type(root_error).__name__,
+            )
+            # Global checks have no cog handler. Give a concise reply only in
+            # that case; cogs with their own UX retain control of the response.
+            if not cog_has_custom_error_handler(ctx.cog):
+                try:
+                    if isinstance(root_error, commands.CommandOnCooldown):
+                        message = f"Please wait `{max(1, root_error.retry_after):.1f}s` before using another command."
+                    else:
+                        message = str(root_error) or "You cannot use that command here."
+                    await ctx.send(embed=error_embed(ctx, "Not Allowed", message))
+                except discord.HTTPException:
+                    pass
+            return
+
+        if isinstance(root_error, commands.UserInputError):
+            logger.warning(
+                "Invalid command input | user_id=%s | command=%s | error=%s",
+                user_id, command_name, root_error,
+            )
+            command_logger.info(
+                "INPUT_ERROR | user_id=%s | guild_id=%s | channel_id=%s | command=%s | error=%s",
+                user_id, getattr(ctx.guild, "id", None), getattr(ctx.channel, "id", None),
+                command_name, type(root_error).__name__,
+            )
+            # Cogs with their own handler own the UX to avoid duplicate replies.
+            if not cog_has_custom_error_handler(ctx.cog):
+                try:
+                    usage = f"Usage: `{ctx.clean_prefix}{command_name} {ctx.command.signature}`"
+                    await ctx.send(embed=error_embed(ctx, "Incorrect Usage", f"{usage}\nUse `{ctx.clean_prefix}help {command_name}` for help."))
+                except discord.HTTPException:
+                    pass
+            return
+
+        logger.error(
+            "Command failed | user_id=%s | guild_id=%s | channel_id=%s | command=%s | error_type=%s | error=%s",
+            user_id, getattr(ctx.guild, "id", None), getattr(ctx.channel, "id", None),
+            command_name, type(root_error).__name__, root_error,
+            exc_info=(type(root_error), root_error, root_error.__traceback__),
+        )
+        command_logger.error(
+            "FAILED | user_id=%s | guild_id=%s | channel_id=%s | command=%s | error_type=%s",
+            user_id, getattr(ctx.guild, "id", None), getattr(ctx.channel, "id", None),
+            command_name, type(root_error).__name__,
+        )
+
+    async def on_error(self, event_method, *args, **kwargs):
+        logger.exception("Unhandled event exception in %s", event_method)
 
     async def close(self):
         # Let cogs cancel their background tasks and flush pending state while
@@ -441,12 +635,13 @@ class Nuvella(commands.Bot):
         for cog_name in list(self.cogs):
             try:
                 await self.remove_cog(cog_name)
-            except Exception as exc:
-                console.print(f"[yellow]Failed unloading cog {cog_name}: {exc}[/yellow]")
+            except Exception:
+                logger.exception("Failed unloading cog %s", cog_name)
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         if self.pool and not self.pool.is_closing():
             await self.pool.close()
+        logger.info("Bot resources closed")
         await super().close()
 
     async def is_blacklisted(self, uid: int) -> bool:
@@ -491,18 +686,18 @@ class Nuvella(commands.Bot):
         if ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
             try:
                 await message.delete()
-            except Exception as e:
-                console.print_exception(show_locals=True)
-                console.print("[red]Failed to delete message in wrong channel.[/red]")
+            except Exception:
+                logger.exception("Failed to delete out-of-channel command | user_id=%s | channel_id=%s",
+                                 message.author.id, message.channel.id)
             if ALLOWED_CHANNEL_ID and message.author.id not in _channel_warned:
                 _channel_warned.add(message.author.id)
                 try:
                     embed = error_embed(message, "Wrong Channel",
                                         f"Commands can only be used in <#{ALLOWED_CHANNEL_ID}>.")
                     await message.channel.send(embed=embed, delete_after=10)
-                except Exception as e:
-                    console.print_exception(show_locals=True)
-                    console.print("[red]Failed to send channel warning.[/red]")
+                except Exception:
+                    logger.exception("Failed to send wrong-channel notice | user_id=%s | channel_id=%s",
+                                     message.author.id, message.channel.id)
             return
 
         await self.process_commands(message)
