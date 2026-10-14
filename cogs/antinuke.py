@@ -14,7 +14,7 @@ from pathlib import Path
 
 from utils.components import ComponentsV2View, disable_all_components
 
-# ─── Load emojis from ./data/emoji.json ─────────────────────────
+# \u2500\u2500\u2500 Load emojis from ./data/emoji.json \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 EMOJI_PATH = os.path.join(".", "data", "emoji.json")
 
 
@@ -32,11 +32,11 @@ EMOJIS = _load_emojis()
 
 
 def emoji(name: str, fallback: str = "") -> str:
-    """Safe emoji getter — always reads from ./data/emoji.json."""
+    """Safe emoji getter \u2014 always reads from ./data/emoji.json."""
     return EMOJIS.get(name, fallback)
 
 
-# ─── Constants ────────────────────────────────────────────────────
+# \u2500\u2500\u2500 Constants \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 GREY_COLOR = 0x2B2D31  # modern Discord grey
 MAIN_COLOR = GREY_COLOR
 WIN_COLOR = GREY_COLOR
@@ -58,7 +58,7 @@ INVITE_PATTERN = re.compile(
 CONFIG_PATH = "config.json"
 
 
-# ─── Embed helpers ────────────────────────────────────────────────
+# \u2500\u2500\u2500 Embed helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 def make_embed(ctx, title, description, color=GREY_COLOR):
     return discord.Embed(title=title, description=description, color=GREY_COLOR)
 
@@ -89,9 +89,9 @@ def fmt_duration(seconds: int) -> str:
     return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
-# ─── Config loader (single source of truth: config.json) ─────────
+# \u2500\u2500\u2500 Config loader (single source of truth: config.json) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 def load_config() -> dict:
-    """Read config.json. If missing, return an empty dict — no hardcoded values."""
+    """Read config.json. If missing, return an empty dict \u2014 no hardcoded values."""
     if not os.path.exists(CONFIG_PATH):
         return {}
     try:
@@ -101,7 +101,7 @@ def load_config() -> dict:
         return {}
 
 
-# ─── Permission decorator ────────────────────────────────────────
+# \u2500\u2500\u2500 Permission decorator \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 def require(level: str):
     if level not in PERM_LEVELS:
         raise ValueError(f"Invalid permission level: {level}")
@@ -124,7 +124,7 @@ def require(level: str):
     return decorator
 
 
-# ─── Database helper ─────────────────────────────────────────────
+# \u2500\u2500\u2500 Database helper \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 class Database:
     def __init__(self, bot):
         self.bot = bot
@@ -170,7 +170,7 @@ class AntinukePanelView(ComponentsV2View):
 
         self.setting_row = discord.ui.ActionRow()
         self.setting_select = discord.ui.Select(
-            placeholder="Choose a protection setting…", min_values=1, max_values=1, row=0,
+            placeholder="Choose a protection setting\u2026", min_values=1, max_values=1, row=0,
             options=[discord.SelectOption(label=item["label"], value=key, description=item["description"][:100])
                      for key, item in ANTINUKE_PANEL_OPTIONS.items()],
         )
@@ -179,11 +179,11 @@ class AntinukePanelView(ComponentsV2View):
         self.add_item(self.setting_row)
 
         self.actions = discord.ui.ActionRow()
-        self.lower_button = discord.ui.Button(label="Lower", style=discord.ButtonStyle.secondary, emoji=emoji("arrow_left", "◀"))
-        self.raise_button = discord.ui.Button(label="Raise", style=discord.ButtonStyle.primary, emoji=emoji("arrow_right", "▶"))
-        self.toggle_button = discord.ui.Button(label="Enable / Disable", style=discord.ButtonStyle.success, emoji=emoji("shield", "🛡️"))
-        self.refresh_button = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, emoji=emoji("refresh", "🔄"))
-        self.exit_button = discord.ui.Button(label="Exit", style=discord.ButtonStyle.danger, emoji=emoji("cross", "✖"))
+        self.lower_button = discord.ui.Button(label="Lower", style=discord.ButtonStyle.secondary, emoji=emoji("arrow_left", "\u25c0"))
+        self.raise_button = discord.ui.Button(label="Raise", style=discord.ButtonStyle.primary, emoji=emoji("arrow_right", "\u25b6"))
+        self.toggle_button = discord.ui.Button(label="Enable / Disable", style=discord.ButtonStyle.success, emoji=emoji("shield", "\U0001f6e1\ufe0f"))
+        self.refresh_button = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, emoji=emoji("refresh", "\U0001f504"))
+        self.exit_button = discord.ui.Button(label="Exit", style=discord.ButtonStyle.danger, emoji=emoji("cross", "\u2716"))
         self.lower_button.callback = self._lower
         self.raise_button.callback = self._raise
         self.toggle_button.callback = self._toggle
@@ -208,12 +208,12 @@ class AntinukePanelView(ComponentsV2View):
         else:
             shown = str(current)
         embed = discord.Embed(
-            title=f"{emoji('shield', '🛡️')} AntiNuke Control Panel",
+            title=f"{emoji('shield', '\U0001f6e1\ufe0f')} AntiNuke Control Panel",
             description=(
                 f"**Protection:** {'Enabled' if self.cog.antinuke_enabled else 'Disabled'}\n"
                 f"**Selected:** {option['label']}\n{option['description']}\n\n"
                 f"**Current value:** `{shown}`\n"
-                f"**Allowed range:** `{option['minimum']}` – `{option['maximum']}`\n\n"
+                f"**Allowed range:** `{option['minimum']}` \u2013 `{option['maximum']}`\n\n"
                 "Use **Lower** and **Raise** to change the selected value. Updates are saved to `config.json` and survive restarts.\n"
                 f"**Message flood rule:** {self.cog.msg_spam_limit} messages in {self.cog.window}s; "
                 f"near-duplicate threshold: {self.cog.dup_msg_limit}; similarity: {self.cog.similarity_threshold:.2f}."
@@ -303,7 +303,7 @@ class AntinukePanelView(ComponentsV2View):
 
     async def _exit(self, interaction: discord.Interaction):
         # FIX: previously called edit_message(view=None), which sends a payload
-        # with no content and no embed → Discord API error 50006
+        # with no content and no embed \u2192 Discord API error 50006
         # ("Cannot send an empty message"). Delete the panel instead.
         self.stop()
         try:
@@ -328,7 +328,7 @@ class AntinukePanelView(ComponentsV2View):
                     pass
 
 
-# ─── AntiNuke Cog ─────────────────────────────────────────────────
+# \u2500\u2500\u2500 AntiNuke Cog \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 class Antinuke(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -345,11 +345,11 @@ class Antinuke(commands.Cog):
         self.antiphish_enabled = self.config.get("antiphish_enabled", True)
         self.wordfilter_enabled = self.config.get("wordfilter_enabled", True)
 
-        # Antinuke sub-config — pull every value from config.json
+        # Antinuke sub-config \u2014 pull every value from config.json
         an = self.config.get("antinuke", {}) or {}
         self.antinuke_enabled        = an.get("enabled", True)
 
-        # ── Spam (advanced) ──
+        # \u2500\u2500 Spam (advanced) \u2500\u2500
         # Default changed: 5 msgs / 5s window (was 3 / 5s)
         self.msg_spam_limit          = an.get("message_spam_limit", 5)     # 5 msgs / window
         self.window                  = an.get("window", 5)                 # 5s window
@@ -360,7 +360,7 @@ class Antinuke(commands.Cog):
         self.spam_kick_strikes       = an.get("spam_kick_strikes", 5)
         self.strike_decay_seconds    = an.get("strike_decay_seconds", 900)
 
-        # ── Other thresholds ──
+        # \u2500\u2500 Other thresholds \u2500\u2500
         self.mention_limit           = an.get("mention_limit", 5)
         self.same_user_ping_limit    = an.get("same_user_ping_limit", 8)
         self.emoji_limit             = an.get("emoji_limit", 10)
@@ -459,7 +459,7 @@ class Antinuke(commands.Cog):
                 pass
         self._init_task = None
 
-    # ─── Init / data loading ─────────────────────────────────────
+    # \u2500\u2500\u2500 Init / data loading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     async def _init_and_load(self):
         await self.db.execute(
             "CREATE TABLE IF NOT EXISTS phish_domains (domain TEXT PRIMARY KEY)"
@@ -491,7 +491,7 @@ class Antinuke(commands.Cog):
         rows = await self.db.fetch("SELECT user_id FROM trusted_mods")
         self.trusted_mods = {int(r["user_id"]) for r in rows}
 
-    # ─── Config helpers (all pulled from config.json) ────────────
+    # \u2500\u2500\u2500 Config helpers (all pulled from config.json) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def _roles_cfg(self) -> dict:
         return (self.config.get("roles") or {})
 
@@ -522,7 +522,7 @@ class Antinuke(commands.Cog):
                 ids.add(rid)
         return ids
 
-    # ─── Permission helpers ──────────────────────────────────────
+    # \u2500\u2500\u2500 Permission helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def is_staff(self, member: discord.Member) -> bool:
         if not member or not getattr(member, "guild", None):
             return False
@@ -594,7 +594,7 @@ class Antinuke(commands.Cog):
             return "moderator"
         return "user"
 
-    # ─── Logging ─────────────────────────────────────────────────
+    # \u2500\u2500\u2500 Logging \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def get_log_channel(self):
         if not self.log_channel_id:
             return None
@@ -610,19 +610,19 @@ class Antinuke(commands.Cog):
         if not channel:
             return
         embed = discord.Embed(
-            title=f"{emoji('shield')} AntiNuke — {title}",
+            title=f"{emoji('shield')} AntiNuke \u2014 {title}",
             description=(desc or "No additional details supplied.")[:4000],
             color=GREY_COLOR,
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(name="Guild", value=f"{guild.name} (`{guild.id}`)", inline=False)
-        embed.set_footer(text="AntiNuke System • action audit")
+        embed.set_footer(text="AntiNuke System \u2022 action audit")
         try:
             await channel.send(view=ComponentsV2View(timeout=120, embed=embed), allowed_mentions=discord.AllowedMentions.none())
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    # ─── Moderation helpers ──────────────────────────────────────
+    # \u2500\u2500\u2500 Moderation helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     async def _antinuke_notice(self, message: discord.Message, member: discord.Member, reason: str):
         try:
             notice = await message.channel.send(f"{member.mention} {emoji('warning')} {reason}")
@@ -664,7 +664,7 @@ class Antinuke(commands.Cog):
                 except Exception:
                     pass
 
-    # ─── Spam detection helpers ──────────────────────────────────
+    # \u2500\u2500\u2500 Spam detection helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @staticmethod
     def _normalize(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").lower()).strip()
@@ -704,7 +704,7 @@ class Antinuke(commands.Cog):
             return ("timeout", self.spam_escalation[idx])
         return ("kick", 0)
 
-    # ─── on_message protections ──────────────────────────────────
+    # \u2500\u2500\u2500 on_message protections \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot or not self.antinuke_enabled:
@@ -716,7 +716,7 @@ class Antinuke(commands.Cog):
         uid = member.id
         now = time.time()
 
-        # ─── Invite filter ───────────────────────────────────────
+        # \u2500\u2500\u2500 Invite filter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if not any(role.id in self.allowed_link_role_ids for role in member.roles):
             invite_match = INVITE_PATTERN.search(message.content)
             if invite_match:
@@ -741,13 +741,13 @@ class Antinuke(commands.Cog):
                         reason = "Sending Discord invite link"
                         await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", True)
                         await self._auto_timeout(member, self.invite_timeout_seconds, f"AntiNuke: {reason}")
-                        await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.invite_timeout_seconds)}.")
+                        await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.invite_timeout_seconds)}.")
                         await self.log_antinuke(message.guild, "Invite Link", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention} (`{message.channel.id}`)\n**Deleted content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted, warning stored, timeout={self.invite_timeout_seconds}s")
                         return
                     finally:
                         self._invite_handling.discard(uid)
 
-        # ─── Phishing ────────────────────────────────────────────
+        # \u2500\u2500\u2500 Phishing \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if self.antiphish_enabled and self.phish_domains:
             content_lower = message.content.lower()
             for domain in self.phish_domains:
@@ -763,13 +763,13 @@ class Antinuke(commands.Cog):
                         reason = f"Phishing link detected: {domain}"
                         await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", True)
                         await self._auto_timeout(member, self.phish_timeout_seconds, f"AntiNuke: {reason}")
-                        await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.phish_timeout_seconds)}.")
+                        await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.phish_timeout_seconds)}.")
                         await self.log_antinuke(message.guild, "Phishing Link", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention} (`{message.channel.id}`)\n**Matched domain:** `{domain}`\n**Deleted content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted, warning stored, timeout={self.phish_timeout_seconds}s")
                         return
                     finally:
                         self._phish_handling.discard(uid)
 
-        # ─── Word filter ─────────────────────────────────────────
+        # \u2500\u2500\u2500 Word filter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if self.wordfilter_enabled and self.banned_words:
             content_lower = message.content.lower()
             for word in self.banned_words:
@@ -785,13 +785,13 @@ class Antinuke(commands.Cog):
                         reason = f"Used banned word: '{word}'"
                         await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", False)
                         await self._auto_timeout(member, self.word_timeout_seconds, f"AntiNuke: {reason}")
-                        await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.word_timeout_seconds)}.")
+                        await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.word_timeout_seconds)}.")
                         await self.log_antinuke(message.guild, "Word Filter", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention} (`{message.channel.id}`)\n**Matched term:** `{word}`\n**Deleted content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted, warning stored")
                         return
                     finally:
                         self._word_handling.discard(uid)
 
-        # ─── Repeated single-user pings ──────────────────────────
+        # \u2500\u2500\u2500 Repeated single-user pings \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if uid not in self.trusted_mods and uid not in self.trusted_admins and message.mentions:
             ping_counts = {}
             for u in message.mentions:
@@ -805,11 +805,11 @@ class Antinuke(commands.Cog):
                 reason = f"Mass pinging a single user ({worst_count}x)"
                 await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", True)
                 await self._auto_timeout(member, self.soft_mute_seconds, reason=reason)
-                await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.soft_mute_seconds)}.")
+                await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.soft_mute_seconds)}.")
                 await self.log_antinuke(message.guild, "Mass Ping (Same User)", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention}\n**Target:** <@{worst_target}> ({worst_target})\n**Repeated ping count:** {worst_count}\n**Content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted, warning stored, timeout={self.soft_mute_seconds}s")
                 return
 
-        # ─── Message spam (advanced) ─────────────────────────────
+        # \u2500\u2500\u2500 Message spam (advanced) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         norm = self._normalize(message.content)
 
         if uid not in self._spam_handling:
@@ -875,7 +875,7 @@ class Antinuke(commands.Cog):
                     if action == "warn":
                         await self._antinuke_notice(
                             message, member,
-                            f"{reason}. Please don't spam — next offense is a mute.",
+                            f"{reason}. Please don't spam \u2014 next offense is a mute.",
                         )
                     elif action == "timeout":
                         await self._add_warning(
@@ -906,8 +906,8 @@ class Antinuke(commands.Cog):
                         f"**Channel:** {message.channel.mention} (`{message.channel.id}`)\n"
                         f"**Messages in {self.window}s:** {msg_count}\n"
                         f"**Duplicate / near-duplicate:** {dup_count}\n"
-                        f"**Mentions:** {mentions}  •  **Emojis:** {emojis}  •  **Caps:** {caps:.0%}\n"
-                        f"**Strike:** {strike}  •  **Action:** {action}"
+                        f"**Mentions:** {mentions}  \u2022  **Emojis:** {emojis}  \u2022  **Caps:** {caps:.0%}\n"
+                        f"**Strike:** {strike}  \u2022  **Action:** {action}"
                         + (f" ({seconds}s)" if seconds else "")
                         + f"\n**Last content:** {message.content[:800] or '[empty]'}",
                     )
@@ -916,7 +916,7 @@ class Antinuke(commands.Cog):
                 finally:
                     self._spam_handling.discard(uid)
 
-        # ─── Mass mention ────────────────────────────────────────
+        # \u2500\u2500\u2500 Mass mention \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         mention_count = len(set(message.mentions + message.role_mentions))
         if uid not in self.trusted_mods and uid not in self.trusted_admins and mention_count >= self.mention_limit:
             try:
@@ -926,11 +926,11 @@ class Antinuke(commands.Cog):
             reason = f"Mass mention ({mention_count} mentions)"
             await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", True)
             await self._auto_timeout(member, self.soft_mute_seconds, reason=reason)
-            await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.soft_mute_seconds)}.")
+            await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.soft_mute_seconds)}.")
             await self.log_antinuke(message.guild, "Mass Mention", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention} (`{message.channel.id}`)\n**Mention count:** {mention_count}\n**Members:** {', '.join(m.mention for m in message.mentions[:20]) or 'None'}\n**Roles:** {', '.join(r.mention for r in message.role_mentions[:20]) or 'None'}\n**Content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted, warning stored, timeout={self.soft_mute_seconds}s")
             return
 
-        # ─── Emoji spam ──────────────────────────────────────────
+        # \u2500\u2500\u2500 Emoji spam \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         emojis_found = re.findall(r"<a?:\w+:\d+>", message.content)
         if uid not in self.trusted_users and uid not in self.trusted_admins and len(emojis_found) >= self.emoji_limit:
             try:
@@ -942,12 +942,12 @@ class Antinuke(commands.Cog):
             if strike > 1:
                 await self._add_warning(member.id, self.bot.user.id, f"[AntiNuke] {reason}", False)
                 await self._auto_timeout(member, self.soft_mute_seconds, reason=reason)
-                await self._antinuke_notice(message, member, f"{reason} — muted {fmt_duration(self.soft_mute_seconds)}.")
+                await self._antinuke_notice(message, member, f"{reason} \u2014 muted {fmt_duration(self.soft_mute_seconds)}.")
             else:
-                await self._antinuke_notice(message, member, f"{reason} — this is a warning, next time you'll be muted.")
+                await self._antinuke_notice(message, member, f"{reason} \u2014 this is a warning, next time you'll be muted.")
             await self.log_antinuke(message.guild, "Emoji Spam", f"**User:** {member} (`{member.id}`)\n**Channel:** {message.channel.mention} (`{message.channel.id}`)\n**Custom emoji count:** {len(emojis_found)} (limit {self.emoji_limit})\n**Content:** {message.content[:1200] or '[empty]'}\n**Action:** message deleted; timeout/warning behavior applied")
 
-    # ─── Join raid / bot add protection ──────────────────────────
+    # \u2500\u2500\u2500 Join raid / bot add protection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         if not self.antinuke_enabled:
@@ -968,7 +968,7 @@ class Antinuke(commands.Cog):
                 await self.log_antinuke(
                     guild,
                     "Possible Raid",
-                    f"≥{self.gateway_threshold} users joined in {self.gateway_window}s.\n"
+                    f"\u2265{self.gateway_threshold} users joined in {self.gateway_window}s.\n"
                     "Verification set to Highest and all channels locked.",
                 )
                 try:
@@ -1011,7 +1011,7 @@ class Antinuke(commands.Cog):
                 await self.log_antinuke(
                     guild,
                     "Bot Added (Trusted)",
-                    f"{adder.mention} (`{adder.id}`) added {member.mention} (`{member.id}`) — trusted, allowed.",
+                    f"{adder.mention} (`{adder.id}`) added {member.mention} (`{member.id}`) \u2014 trusted, allowed.",
                 )
                 return
 
@@ -1035,7 +1035,7 @@ class Antinuke(commands.Cog):
                 await self.log_antinuke(
                     guild,
                     "Untrusted Bot Add",
-                    f"{adder.mention} (`{adder.id}`) added {member.mention} (`{member.id}`) — bot kicked (not trusted, not admin).",
+                    f"{adder.mention} (`{adder.id}`) added {member.mention} (`{member.id}`) \u2014 bot kicked (not trusted, not admin).",
                 )
                 return
 
@@ -1065,7 +1065,7 @@ class Antinuke(commands.Cog):
         finally:
             self._bot_handling.discard(guild.id)
 
-    # ─── Audit-log flood checks ──────────────────────────────────
+    # \u2500\u2500\u2500 Audit-log flood checks \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel):
         if self.antinuke_enabled:
@@ -1122,7 +1122,7 @@ class Antinuke(commands.Cog):
             dq.popleft()
         if len(dq) >= limit:
             dq.clear()
-            reason = f"{label} (≥{limit} in {self.window}s)"
+            reason = f"{label} (\u2265{limit} in {self.window}s)"
             await self.log_antinuke(guild, label, f"{executor.mention} (`{executor.id}`)\n{reason}")
             member = guild.get_member(executor.id)
             if member:
@@ -1136,7 +1136,7 @@ class Antinuke(commands.Cog):
                     pass
                 await self._auto_timeout(member, 600, reason=f"AntiNuke: {reason}")
 
-    # ─── Commands: antinuke ──────────────────────────────────────
+    # \u2500\u2500\u2500 Commands: antinuke \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @commands.group(name="antinuke", invoke_without_command=True)
     @require("admin")
     async def antinuke_group(self, ctx):
@@ -1145,14 +1145,14 @@ class Antinuke(commands.Cog):
             ctx,
             f"{emoji('shield')} AntiNuke System",
             f"**Status:** {status}\n\n"
-            "`antinuke enable` — Activate\n"
-            "`antinuke disable` — Deactivate\n"
-            "`antinuke status` — View thresholds\n"
-            "`antinuke panel` — Interactive Components V2 settings\n"
-            "`antinuke threshold <type> <value>` — Adjust and save a threshold\n"
-            "`antinuke unraidlock` — Restore after raid lock\n"
-            "`antinuke spamreset <user>` — Clear a user's spam strikes\n"
-            "`atrust add/remove <user>` — Manage trusted admins",
+            "`antinuke enable` \u2014 Activate\n"
+            "`antinuke disable` \u2014 Deactivate\n"
+            "`antinuke status` \u2014 View thresholds\n"
+            "`antinuke panel` \u2014 Interactive Components V2 settings\n"
+            "`antinuke threshold <type> <value>` \u2014 Adjust and save a threshold\n"
+            "`antinuke unraidlock` \u2014 Restore after raid lock\n"
+            "`antinuke spamreset <user>` \u2014 Clear a user's spam strikes\n"
+            "`atrust add/remove <user>` \u2014 Manage trusted admins",
             GREY_COLOR,
         )
         await ctx.reply(embed=embed)
@@ -1211,22 +1211,22 @@ class Antinuke(commands.Cog):
         status = f"{emoji('tick')} Active" if self.antinuke_enabled else f"{emoji('cross')} Inactive"
         embed = make_embed(ctx, f"{emoji('shield')} AntiNuke Status", f"**Status:** {status}", GREY_COLOR)
         thresholds = [
-            (f"{emoji('message')} Message Spam", f"≥{self.msg_spam_limit} msgs in {self.window}s  •  ≥{self.dup_msg_limit} duplicates"),
-            (f"{emoji('mail')} Mass Mention", f"≥{self.mention_limit} mentions/msg"),
-            (f"{emoji('laugh')} Emoji Spam", f"≥{self.emoji_limit} custom emojis/msg"),
-            (f"{emoji('red_shield')} Gateway (Raid)", f"≥{self.gateway_threshold} joins in {self.gateway_window}s"),
-            (f"{emoji('file')} Channel Flood", f"≥{self.channel_limit} creates/deletes in {self.window}s"),
-            (f"{emoji('roles')} Role Flood", f"≥{self.role_limit} creates/deletes in {self.window}s"),
-            (f"{emoji('gear')} Mass Ban", f"≥{self.ban_limit} bans in {self.window}s"),
+            (f"{emoji('message')} Message Spam", f"\u2265{self.msg_spam_limit} msgs in {self.window}s  \u2022  \u2265{self.dup_msg_limit} duplicates"),
+            (f"{emoji('mail')} Mass Mention", f"\u2265{self.mention_limit} mentions/msg"),
+            (f"{emoji('laugh')} Emoji Spam", f"\u2265{self.emoji_limit} custom emojis/msg"),
+            (f"{emoji('red_shield')} Gateway (Raid)", f"\u2265{self.gateway_threshold} joins in {self.gateway_window}s"),
+            (f"{emoji('file')} Channel Flood", f"\u2265{self.channel_limit} creates/deletes in {self.window}s"),
+            (f"{emoji('roles')} Role Flood", f"\u2265{self.role_limit} creates/deletes in {self.window}s"),
+            (f"{emoji('gear')} Mass Ban", f"\u2265{self.ban_limit} bans in {self.window}s"),
             (f"{emoji('lock')} Raid Locked Guilds", str(len(self._raid_locked))),
-            (f"{emoji('link')} Invite Links", f"External invites → delete + {self.invite_timeout_seconds//60}‑min mute"),
+            (f"{emoji('link')} Invite Links", f"External invites \u2192 delete + {self.invite_timeout_seconds//60}\u2011min mute"),
             (
-                f"{emoji('fishing_rod')} Anti‑Phishing",
-                f"{emoji('tick') if self.antiphish_enabled else emoji('cross')} → delete + {self.phish_timeout_seconds//60}‑min mute",
+                f"{emoji('fishing_rod')} Anti\u2011Phishing",
+                f"{emoji('tick') if self.antiphish_enabled else emoji('cross')} \u2192 delete + {self.phish_timeout_seconds//60}\u2011min mute",
             ),
             (
                 f"{emoji('alphabet')} Word Filter",
-                f"{emoji('tick') if self.wordfilter_enabled else emoji('cross')} → delete + {self.word_timeout_seconds//60}‑min mute",
+                f"{emoji('tick') if self.wordfilter_enabled else emoji('cross')} \u2192 delete + {self.word_timeout_seconds//60}\u2011min mute",
             ),
             (f"{emoji('handshake')} Trusted Admins", str(len(self.trusted_admins))),
             (f"{emoji('laugh')} Trusted Users (emoji cap bypass)", str(len(self.trusted_users))),
@@ -1264,7 +1264,7 @@ class Antinuke(commands.Cog):
             logging.getLogger("nuvella.antinuke").exception("Failed to save threshold | type=%s", t)
             await ctx.reply(embed=error_embed(ctx, "Could not save that setting. Check `logs/errors.log`."))
 
-    # ─── Commands: atrust ────────────────────────────────────────
+    # \u2500\u2500\u2500 Commands: atrust \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     @commands.group(name="atrust", invoke_without_command=True)
     @require("admin")
     async def atrust_group(self, ctx):
@@ -1272,9 +1272,9 @@ class Antinuke(commands.Cog):
             ctx,
             f"{emoji('handshake')} Trusted Admins",
             "Manage which admins are allowed to add bots without triggering protection.\n\n"
-            "`atrust add <user>` — Trust an admin to add bots\n"
-            "`atrust remove <user>` — Remove trust\n"
-            "`atrust list` — View trusted admins\n\n"
+            "`atrust add <user>` \u2014 Trust an admin to add bots\n"
+            "`atrust remove <user>` \u2014 Remove trust\n"
+            "`atrust list` \u2014 View trusted admins\n\n"
             "> If a **non-trusted admin** adds a bot, the bot will be kicked and the admin role revoked.",
             GREY_COLOR,
         )
@@ -1342,9 +1342,9 @@ class Antinuke(commands.Cog):
         for uid in self.trusted_admins:
             member = ctx.guild.get_member(uid)
             if member:
-                lines.append(f"• {member.mention} (`{uid}`)")
+                lines.append(f"\u2022 {member.mention} (`{uid}`)")
             else:
-                lines.append(f"• Unknown (`{uid}`)")
+                lines.append(f"\u2022 Unknown (`{uid}`)")
 
         embed = make_embed(
             ctx,
@@ -1379,7 +1379,7 @@ class Antinuke(commands.Cog):
     @atrust_user_group.command(name="list")
     @require("admin")
     async def atrust_user_list(self, ctx):
-        rows = [f"• {ctx.guild.get_member(uid).mention if ctx.guild.get_member(uid) else f'Unknown (`{uid}`)'}" for uid in sorted(self.trusted_users)]
+        rows = [f"\u2022 {ctx.guild.get_member(uid).mention if ctx.guild.get_member(uid) else f'Unknown (`{uid}`)'}" for uid in sorted(self.trusted_users)]
         await ctx.reply(embed=make_embed(ctx, "Trusted Users", "\n".join(rows) if rows else "No trusted users configured.", GREY_COLOR))
 
     @commands.group(name="atrustmod", aliases=["trustedmod"], invoke_without_command=True)
@@ -1406,7 +1406,7 @@ class Antinuke(commands.Cog):
     @atrust_mod_group.command(name="list")
     @require("admin")
     async def atrust_mod_list(self, ctx):
-        rows = [f"• {ctx.guild.get_member(uid).mention if ctx.guild.get_member(uid) else f'Unknown (`{uid}`)'}" for uid in sorted(self.trusted_mods)]
+        rows = [f"\u2022 {ctx.guild.get_member(uid).mention if ctx.guild.get_member(uid) else f'Unknown (`{uid}`)'}" for uid in sorted(self.trusted_mods)]
         await ctx.reply(embed=make_embed(ctx, "Trusted Moderators", "\n".join(rows) if rows else "No trusted moderators configured.", GREY_COLOR))
 
 
