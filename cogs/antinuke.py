@@ -7,6 +7,7 @@ import re
 import datetime
 import json
 import os
+import logging                     # FIX: was missing, caused NameError
 from difflib import SequenceMatcher
 from collections import defaultdict, deque
 from pathlib import Path
@@ -224,23 +225,38 @@ class AntinukePanelView(ComponentsV2View):
         return embed
 
     async def _save_and_refresh(self, interaction: discord.Interaction, value):
+        # 1) Persist first. If this fails, report to the user (best effort).
         try:
             await self.cog.persist_antinuke_setting(self.selected_key, value)
-            self.set_embed(self.render_embed())
-            await interaction.response.edit_message(view=self)
         except Exception:
             logging.getLogger("nuvella.antinuke").exception(
                 "Could not persist AntiNuke setting | key=%s | actor_id=%s",
                 self.selected_key, interaction.user.id,
             )
-            await interaction.response.send_message(
-                "Could not save this setting. Check `logs/errors.log`.", ephemeral=True
+            try:
+                await interaction.response.send_message(
+                    "Could not save this setting. Check `logs/errors.log`.", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # 2) Refresh the panel. A failure here is cosmetic, not fatal.
+        self.set_embed(self.render_embed())
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            logging.getLogger("nuvella.antinuke").exception(
+                "Failed to refresh AntiNuke panel | key=%s", self.selected_key,
             )
 
     async def _select_setting(self, interaction: discord.Interaction):
         self.selected_key = interaction.data["values"][0]
         self.set_embed(self.render_embed())
-        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            logging.getLogger("nuvella.antinuke").exception("Failed to change selected setting")
 
     async def _adjust(self, interaction: discord.Interaction, direction: int):
         option = ANTINUKE_PANEL_OPTIONS[self.selected_key]
@@ -260,23 +276,44 @@ class AntinukePanelView(ComponentsV2View):
     async def _toggle(self, interaction: discord.Interaction):
         try:
             await self.cog.persist_antinuke_setting("enabled", not self.cog.antinuke_enabled)
-            self.set_embed(self.render_embed())
-            await interaction.response.edit_message(view=self)
         except Exception:
             logging.getLogger("nuvella.antinuke").exception(
                 "Could not toggle AntiNuke | actor_id=%s", interaction.user.id
             )
-            await interaction.response.send_message(
-                "Could not save AntiNuke state. Check `logs/errors.log`.", ephemeral=True
-            )
+            try:
+                await interaction.response.send_message(
+                    "Could not save AntiNuke state. Check `logs/errors.log`.", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        self.set_embed(self.render_embed())
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            logging.getLogger("nuvella.antinuke").exception("Failed to refresh AntiNuke toggle state")
 
     async def _refresh(self, interaction: discord.Interaction):
         self.set_embed(self.render_embed())
-        await interaction.response.edit_message(view=self)
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            logging.getLogger("nuvella.antinuke").exception("Failed to refresh AntiNuke panel")
 
     async def _exit(self, interaction: discord.Interaction):
+        # FIX: previously called edit_message(view=None), which sends a payload
+        # with no content and no embed → Discord API error 50006
+        # ("Cannot send an empty message"). Delete the panel instead.
         self.stop()
-        await interaction.response.edit_message(view=None)
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            return
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException:
+            logging.getLogger("nuvella.antinuke").exception("Failed to delete AntiNuke panel on exit")
 
     async def on_timeout(self) -> None:
         disable_all_components(self)
@@ -284,7 +321,11 @@ class AntinukePanelView(ComponentsV2View):
             try:
                 await self.message.edit(view=self)
             except discord.HTTPException:
-                pass
+                # Same 50006 risk if the CV2 view becomes empty after disabling.
+                try:
+                    await self.message.delete()
+                except discord.HTTPException:
+                    pass
 
 
 # ─── AntiNuke Cog ─────────────────────────────────────────────────
@@ -309,7 +350,8 @@ class Antinuke(commands.Cog):
         self.antinuke_enabled        = an.get("enabled", True)
 
         # ── Spam (advanced) ──
-        self.msg_spam_limit          = an.get("message_spam_limit", 3)     # 3 msgs / window
+        # Default changed: 5 msgs / 5s window (was 3 / 5s)
+        self.msg_spam_limit          = an.get("message_spam_limit", 5)     # 5 msgs / window
         self.window                  = an.get("window", 5)                 # 5s window
         self.dup_msg_limit           = an.get("dup_msg_limit", 2)          # 2 identical/near-identical
         self.similarity_threshold    = an.get("similarity_threshold", 0.85)
@@ -788,7 +830,7 @@ class Antinuke(commands.Cog):
             msg_count = len(tq)
 
             # Duplicate / near-duplicate detection is separate from the all-message
-            # flood count, so different short texts still trigger the 3-in-window rule.
+            # flood count, so different short texts still trigger the 5-in-window rule.
             dup_count = 0
             if comparable_text:
                 for _ts, prev in list(cq)[:-1]:
