@@ -7,6 +7,7 @@ import time
 import asyncio
 import os
 import json
+import logging
 import re
 from typing import Optional
 from collections import defaultdict
@@ -14,6 +15,9 @@ from dotenv import load_dotenv
 
 from utils.emoji import EMOJIS
 from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
+from utils.database import run_transaction
+
+log = logging.getLogger("nuvella.economy")
 
 load_dotenv()
 
@@ -32,7 +36,7 @@ CONFIG = load_bot_config()
 LOGGING_CONFIG = CONFIG.get("logging", {}) or {}
 ECONOMY_CONFIG = CONFIG.get("economy", {}) or {}
 ROLES_CONFIG = CONFIG.get("roles", {}) or {}
-PREFIX = str(CONFIG.get("prefix", "*"))
+PREFIX = str(CONFIG.get("prefix", "$"))
 
 DISCORD_LOG_CHANNEL_ID = int(CONFIG.get("log_channel_id") or 0) or None
 ALLOWED_CHANNEL_ID = int(CONFIG.get("allowed_channel_id") or 0) or None
@@ -70,31 +74,41 @@ WHITE_SQUARE = EMOJIS["white_square"]
 
 BREAKER_LINE = EMOJIS["breaker"] * 10
 
+# Read-only commands: skip logging & broke-purge for these.
+READ_ONLY_COMMANDS = frozenset({
+    "balance", "bal",
+    "profile", "prof",
+    "leaderboard", "lb", "top",
+    "inv", "shop",
+    "registeredusers", "totalusers", "regcount",
+    "interestrate", "ir",
+    "economy",
+})
+
 GAMBLING_COMMANDS_LIST = (
     "**Earning**\n"
-    f"{EMOJIS['gift']} `!daily` — claim a daily reward\n"
-    f"{EMOJIS['pouch']} `!collect` — claim role-based daily reward\n"
-    f"{EMOJIS['backpack']} `!work` — work for Moon Dust\n"
-    f"{EMOJIS['beg']} `!beg` — beg for a small chance of Moon Dust\n"
-    f"{EMOJIS['fishes']} `!fish <bet>` — go fishing\n\n"
+    f"{EMOJIS['gift']} `$daily` — claim a daily reward\n"
+    f"{EMOJIS['pouch']} `$collect` — claim role-based daily reward\n"
+    f"{EMOJIS['backpack']} `$work` — work for Moon Dust\n"
+    f"{EMOJIS['beg']} `$beg` — beg for a small chance of Moon Dust\n"
+    f"{EMOJIS['fishes']} `$fish <bet>` — go fishing\n\n"
     "**Gambling**\n"
-    f"{EMOJIS['moon_dust']} `!coinflip <bet>` — 50/50 coin flip\n"
-    f"{EMOJIS['roulette']} `!roulette <bet> [number]` — roulette table\n"
-    f"{CARDS} `!blackjack <bet>` — play the dealer\n"
-    f"{EMOJIS['slot_machine']} `!slots <bet>` — spin the slot machine\n"
-    f"{EMOJIS['spin_wheel']} `!spin <bet>` — spin the wheel\n"
-    f"{EMOJIS['dices']} `!dice <bet> <guess>` — guess the roll\n"
-    f"{CARDS} `!highlow <bet>` — higher or lower\n\n"
+    f"{EMOJIS['moon_dust']} `$coinflip <bet>` — 50/50 coin flip\n"
+    f"{EMOJIS['roulette']} `$roulette <bet> [number]` — roulette table\n"
+    f"{CARDS} `$blackjack <bet>` — play the dealer\n"
+    f"{EMOJIS['slot_machine']} `$slots <bet>` — spin the slot machine\n"
+    f"{EMOJIS['spin_wheel']} `$spin <bet>` — spin the wheel\n"
+    f"{EMOJIS['dices']} `$dice <bet> <guess>` — guess the roll\n"
+    f"{CARDS} `$highlow <bet>` — higher or lower\n\n"
     "**Other**\n"
-    f"{EMOJIS['pouch']} `!balance` — check your wallet/bank\n"
-    f"{EMOJIS['deposit']} `!deposit` / `!withdraw` — move Moon Dust to/from your bank\n"
-    f"{EMOJIS['shopping_cart']} `/buy` — purchase items (slash only)\n"
-    f"{EMOJIS['detective']} `!rob` / `!heist` — try to steal Moon Dust\n"
-    f"{EMOJIS['gift']} `!transfer` — send Moon Dust to another player"
+    f"{EMOJIS['pouch']} `$balance` — check your wallet/bank\n"
+    f"{EMOJIS['deposit']} `$deposit` / `$withdraw` — move Moon Dust to/from your bank\n"
+    f"{EMOJIS['shopping_cart']} `$shop` — open the shop\n"
+    f"{EMOJIS['detective']} `$rob` / `$heist` — try to steal Moon Dust\n"
+    f"{EMOJIS['gift']} `$transfer` — send Moon Dust to another player"
 )
 
 
-# ─── ERROR EMBED SUBCLASS (auto-deletes after 5s) ─────────────
 class ErrorEmbed(discord.Embed):
     """Embed that the patched ctx.send auto-deletes after 5 seconds."""
     pass
@@ -115,10 +129,24 @@ async def log_to_discord(bot, message: str):
     try:
         channel = bot.get_channel(DISCORD_LOG_CHANNEL_ID)
         if channel:
-            for i in range(0, len(message), 2000):
-                await channel.send(message[i:i + 2000])
+            if len(message) <= 2000:
+                await channel.send(message)
+            else:
+                for i in range(0, len(message), 2000):
+                    await channel.send(message[i:i + 2000])
     except Exception as e:
-        print(f"Failed to log to Discord: {e}")
+        log.exception("Failed to send economy log message to Discord")
+
+
+async def log_embed_to_discord(bot, embed: discord.Embed):
+    if not DISCORD_LOG_CHANNEL_ID:
+        return
+    try:
+        channel = bot.get_channel(DISCORD_LOG_CHANNEL_ID)
+        if channel:
+            await channel.send(embed=embed)
+    except Exception as e:
+        log.exception("Failed to send economy log embed to Discord")
 
 
 # ─── DEFAULT SHOP ITEMS ────────────────────────────────────────
@@ -153,6 +181,18 @@ SHOP_EMOJI_MAP = {
     "eight_ball": "black_8ball",
     "mafia_ping": "gun",
     "roulette_ping": "slot_machine",
+}
+
+SHOP_DISPLAY_NAMES = {
+    "watchdog": "WatchDog",
+    "custom_role": "Custom Role",
+    "afk_permission": "AFK Permission",
+    "ghost_ping_viewer": "Ghost Ping Viewer",
+    "tic_tac_toe": "Tic Tac Toe",
+    "rock_paper_scissors": "Rock Paper Scissors",
+    "eight_ball": "Eight Ball",
+    "mafia_ping": "Mafia Ping",
+    "roulette_ping": "Roulette Ping",
 }
 
 
@@ -693,8 +733,9 @@ class HeistJoinView(ComponentsV2View):
         self.cog = cog
         self.host = host
         self.target = target
-        self.participants = set()
+        self.participants = {host.id}
         self.locked = False
+        self._join_lock = asyncio.Lock()
         self.channel = channel
         join_button = discord.ui.Button(label="Join Heist", style=discord.ButtonStyle.secondary, emoji=EMOJIS["heist"])
         join_button.callback = self.join
@@ -718,166 +759,58 @@ class HeistJoinView(ComponentsV2View):
         return embed
 
     async def join(self, interaction: discord.Interaction):
-        if self.locked:
-            return await interaction.response.send_message("Heist already starting...", ephemeral=True)
-        if interaction.user.id in self.participants:
-            return await interaction.response.send_message("You're already in!", ephemeral=True)
-        if interaction.user.id == self.target.id:
-            return await interaction.response.send_message("You can't heist yourself!", ephemeral=True)
-        if len(self.participants) >= 5:
-            return await interaction.response.send_message("The heist is full.", ephemeral=True)
-        if not await self.cog.is_registered(interaction.user.id):
-            return await interaction.response.send_message("You need to `!register` before joining a heist!", ephemeral=True)
-        self.participants.add(interaction.user.id)
-        await interaction.response.send_message(f"You joined! ({len(self.participants)}/5)", ephemeral=True)
-        embed = self.build_lobby_embed()
-        if len(self.participants) >= 5:
-            self.locked = True
-            disable_all_components(self)
-            self.set_embed(embed)
-            await interaction.message.edit(view=self)
-            await self.start_heist()
-        else:
-            self.set_embed(embed)
-            await interaction.message.edit(view=self)
-
-    async def start_heist(self):
-        if len(self.participants) < 5:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.NotFound:
+            log.warning("Russian Roulette join interaction expired | user_id=%s", interaction.user.id)
             return
-        self.locked = True
-        game = HeistGame(self.channel, self.host, self.target, list(self.participants), self.cog)
-        await game.start()
 
+        notice = None
+        should_start = False
+        async with self._join_lock:
+            user_id = interaction.user.id
+            if self.locked:
+                notice = "Game already starting..."
+            elif user_id in self.players:
+                notice = "You're already in!"
+            elif len(self.players) >= self.max_players:
+                notice = "The game is full."
+            elif not await self.cog.is_registered(user_id):
+                notice = "You need to `+register` before joining!"
+            else:
+                wallet = await self.cog.add_wallet(user_id, -self.entry_fee)
+                if wallet is None:
+                    notice = f"You need **{self.entry_fee}** Moon Dust in your wallet to join."
+                else:
+                    self.players.add(user_id)
+                    notice = f"You're in! ({len(self.players)}/{self.max_players})"
+                    embed = self.build_lobby_embed()
+                    should_start = len(self.players) >= self.max_players
+                    if should_start:
+                        self.locked = True
+                        disable_all_components(self)
+                    self.set_embed(embed)
+                    try:
+                        await interaction.message.edit(view=self)
+                    except discord.NotFound:
+                        log.warning("Russian Roulette lobby message expired while updating | channel_id=%s", self.channel.id)
+                    except discord.HTTPException:
+                        log.exception("Could not update Russian Roulette lobby | channel_id=%s", self.channel.id)
 
-class HeistGame:
-    def __init__(self, channel, host, target, participants, cog):
-        self.channel = channel
-        self.host = host
-        self.target = target
-        self.participants = participants
-        self.cog = cog
-
-    async def start(self):
-        target_bank = await self.cog.get_bank(self.target.id)
-        if target_bank <= 0:
-            embed = discord.Embed(title=f"{EMOJIS['cross']} Heist Failed",
-                                  description=f"{self.target.mention} has no Moon Dust in their bank!",
-                                  color=EMBED_COLOR)
-            return await self.channel.send(embed=embed)
-        embed = discord.Embed(
-            title=f"{EMOJIS['heist']} Heist in Progress",
-            description=(f"**Team:** {', '.join(f'<@{uid}>' for uid in self.participants[:3])} +{len(self.participants) - 3} more\n"
-                         f"**Target:** {self.target.mention}\n"
-                         f"**Bank:** {target_bank:,} Moon Dust\n\n{EMOJIS['loop']} Attempting heist..."),
-            color=EMBED_COLOR
-        )
-        msg = await self.channel.send(embed=embed)
-        await asyncio.sleep(2)
-        success = random.random() < 0.35
-        if success:
-            steal_amount = int(target_bank * 0.5)
-            per_person = steal_amount // len(self.participants)
-            async with self.cog.pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "UPDATE users SET bank = bank - $1 WHERE id = $2 AND bank >= $1",
-                        steal_amount, self.target.id
-                    )
-                    for pid in self.participants:
-                        await conn.execute(
-                            "UPDATE users SET wallet = wallet + $1 WHERE id = $2",
-                            per_person, pid
-                        )
-            result_desc = f"{EMOJIS['confetti']} **HEIST SUCCESSFUL!**\n\n"
-            result_desc += f"**Stolen:** `{steal_amount:,}` Moon Dust from {self.target.mention}'s bank\n"
-            result_desc += f"**Per Person:** `{per_person:,}` Moon Dust\n"
-            result_desc += "**Reward Distribution:**\n" + "\n".join(
-                f"• <@{uid}>: `{per_person:,}` Moon Dust" for uid in self.participants[:5])
-            if len(self.participants) > 5:
-                result_desc += f"\n• +{len(self.participants) - 5} more participants"
-            result_embed_msg = discord.Embed(title=f"{EMOJIS['heist']} Heist Complete",
-                                             description=result_desc, color=EMBED_COLOR)
-            result_embed_msg.add_field(name=f"{self.target.display_name}'s Remaining Bank",
-                                       value=f"`{target_bank - steal_amount:,}` Moon Dust", inline=False)
-        else:
-            fail_desc = f"{EMOJIS['broken_heart']} **HEIST FAILED!**\n\n"
-            fail_desc += f"You got caught trying to rob {self.target.mention}'s bank!\n"
-            fail_desc += "**Fine Paid:** `100-300` Moon Dust per person"
-            result_embed_msg = discord.Embed(title=f"{EMOJIS['heist']} Heist Complete",
-                                             description=fail_desc, color=EMBED_COLOR)
-            for pid in self.participants:
-                fine = random.randint(100, 300)
-                await self.cog.add_wallet(pid, -fine)
-        await msg.edit(embed=result_embed_msg)
-        for pid in self.participants:
-            await self.cog.check_broke(pid)
-        await self.cog.check_broke(self.target.id)
-
-
-class RussianRouletteJoinView(ComponentsV2View):
-    def __init__(self, cog, host, entry_fee, max_players, channel):
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.host = host
-        self.entry_fee = entry_fee
-        self.max_players = max_players
-        self.players = set()
-        self.locked = False
-        self.channel = channel
-        join_button = discord.ui.Button(label="Join", style=discord.ButtonStyle.secondary, emoji=EMOJIS["skull"])
-        join_button.callback = self.join
-        self.controls = discord.ui.ActionRow()
-        self.controls.add_item(join_button)
-        self.add_item(self.controls)
-
-    def build_lobby_embed(self):
-        filled = len(self.players)
-        empty = self.max_players - filled
-        bar = EMOJIS["green_square"] * filled + WHITE_SQUARE * empty
-        desc = (f"**Host:** {self.host.mention}\n"
-                f"**Entry fee:** {self.entry_fee} Moon Dust\n"
-                f"**Slots:** {filled}/{self.max_players} {bar}\n{'─' * 20}\n")
-        if self.players:
-            desc += "**Current players:**\n" + "\n".join(f"• <@{uid}>" for uid in self.players)
-        else:
-            desc += "*No one has joined yet. Be the first!*"
-        embed = discord.Embed(title=f"{EMOJIS['skull']} Russian Roulette – Lobby",
-                              description=desc, color=EMBED_COLOR)
-        embed.set_footer(text="Click Join to enter! Game starts when full.")
-        return embed
-
-    async def join(self, interaction: discord.Interaction):
-        if self.locked:
-            return await interaction.response.send_message("Game already starting...", ephemeral=True)
-        if interaction.user.id in self.players:
-            return await interaction.response.send_message("You're already in!", ephemeral=True)
-        if len(self.players) >= self.max_players:
-            return await interaction.response.send_message("The game is full.", ephemeral=True)
-        if not await self.cog.is_registered(interaction.user.id):
-            return await interaction.response.send_message("You need to `!register` before joining!", ephemeral=True)
-        wallet = await self.cog.add_wallet(interaction.user.id, -self.entry_fee)
-        if wallet is None:
-            return await interaction.response.send_message(
-                f"You need **{self.entry_fee}** Moon Dust in your wallet to join.", ephemeral=True)
-        self.players.add(interaction.user.id)
-        await interaction.response.send_message(f"You're in! ({len(self.players)}/{self.max_players})", ephemeral=True)
-        embed = self.build_lobby_embed()
-        if len(self.players) >= self.max_players:
-            self.locked = True
-            disable_all_components(self)
-            self.set_embed(embed)
-            await interaction.message.edit(view=self)
+        if notice:
+            try:
+                await interaction.followup.send(notice, ephemeral=True)
+            except discord.HTTPException:
+                pass
+        if should_start:
             await self.start_game()
-        else:
-            self.set_embed(embed)
-            await interaction.message.edit(view=self)
 
     async def start_game(self):
         if len(self.players) < 2:
             return
         self.locked = True
         game = RussianRouletteGame(self.channel, self.host, self.entry_fee, list(self.players), self.cog)
-        self.cog.russian_games[self.host.guild.id] = game
+        self.cog.russian_games[self.channel.id] = game
         await game.start()
 
 
@@ -965,11 +898,13 @@ class LeaderboardView(ComponentsV2View):
 
     async def on_timeout(self):
         disable_all_components(self)
-        if hasattr(self, "message") and self.message:
+        if getattr(self, "message", None):
             try:
                 await self.message.edit(view=self)
-            except (discord.NotFound, discord.HTTPException):
+            except discord.NotFound:
                 pass
+            except discord.HTTPException:
+                log.exception("Failed to disable expired shop controls | user_id=%s", self.ctx.author.id)
 
     async def on_select(self, interaction: discord.Interaction):
         value = interaction.data["values"][0]
@@ -1040,7 +975,6 @@ class LeaderboardView(ComponentsV2View):
         return embed
 
 
-# ─── BUY SLASH VIEW ─────────────────────────────────────────────
 class BuySelectView(discord.ui.View):
     def __init__(self, cog, user: discord.User, quantity: int, options: list):
         super().__init__(timeout=120)
@@ -1049,6 +983,8 @@ class BuySelectView(discord.ui.View):
         self.quantity = quantity
         self.select = discord.ui.Select(placeholder="Select an item to buy...", options=options)
         self.select.callback = self.on_select
+        self.message: discord.Message | None = None
+        self.processing = False
         self.add_item(self.select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1058,10 +994,378 @@ class BuySelectView(discord.ui.View):
         return True
 
     async def on_select(self, interaction: discord.Interaction):
-        item_name = interaction.data["values"][0]
-        embed = await self.cog._process_purchase_interaction(interaction, item_name, self.quantity)
+        # Prevent multiple purchases if the user double-clicks before the UI refreshes.
+        if self.processing:
+            try:
+                await interaction.response.send_message("A purchase is already being processed.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+        self.processing = True
         self.select.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self)
+        # Acknowledge before any database or Discord role work.
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            log.warning("Shop selection arrived after its interaction expired | user_id=%s", interaction.user.id)
+            self.processing = False
+            return
+        item_name = interaction.data["values"][0]
+        try:
+            embed = await self.cog._process_purchase_interaction(interaction, item_name, self.quantity)
+        except Exception:
+            log.exception(
+                "Shop purchase callback failed | user_id=%s | item=%s",
+                interaction.user.id, item_name,
+            )
+            embed = error_embed_interaction(
+                interaction, "Purchase Failed", "The purchase could not be completed. Please try again later.")
+        try:
+            await interaction.edit_original_response(embed=embed, view=self)
+        except discord.NotFound:
+            log.warning(
+                "Shop purchase response expired | user_id=%s | item=%s",
+                interaction.user.id, item_name,
+            )
+        except discord.HTTPException:
+            log.exception("Could not update shop purchase result | user_id=%s | item=%s", interaction.user.id, item_name)
+
+    async def on_timeout(self):
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                log.exception("Failed to disable expired buy dropdown")
+
+
+class ShopView(ComponentsV2View):
+    """Button-driven shop: Buy, View More, Exit."""
+
+    def __init__(self, cog, ctx):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.ctx = ctx
+        self._purchase_in_progress = False
+        self._build_main_buttons(clear=False)
+
+    def _clear_controls(self):
+        """Remove buttons/select rows without detaching the V2 content container."""
+        for child in list(self.children):
+            if child is not self.content_container:
+                self.remove_item(child)
+
+    def _all_items(self):
+        items = {}
+        for name, item in DEFAULT_SHOP_ITEMS.items():
+            items[name] = {
+                "price": item["price"],
+                "description": item["description"],
+                "type": item.get("type", "consumable"),
+                "custom": False,
+            }
+        for name, item in self.cog.custom_shop_items.items():
+            items[name] = {
+                "price": item["price"],
+                "description": item["description"] or f"Custom {item['type'].capitalize()}",
+                "type": item["type"],
+                "custom": True,
+            }
+        return items
+
+    def _item_emoji(self, name):
+        key = SHOP_EMOJI_MAP.get(name, "package")
+        return EMOJIS.get(key, EMOJIS.get("package", "📦"))
+
+    def _display_name(self, name, is_custom=False):
+        if not is_custom and name in SHOP_DISPLAY_NAMES:
+            return SHOP_DISPLAY_NAMES[name]
+        return name.replace("_", " ").title()
+
+    async def _shop_embed(self):
+        guild = self.ctx.guild
+
+        embed = discord.Embed(
+            title=f"{EMOJIS.get('shopping_cart', '🛒')} Nuvella Shop",
+            color=EMBED_COLOR,
+            timestamp=discord.utils.utcnow(),
+        )
+        if guild:
+            embed.set_author(
+                name=guild.name,
+                icon_url=guild.icon.url if guild.icon else None,
+            )
+
+        items = self._all_items()
+        item_lines = []
+        for idx, (name, item) in enumerate(items.items(), start=1):
+            item_lines.append(f"{idx}) {self._display_name(name, item.get('custom', False))}")
+        item_block = "\n".join(item_lines) if item_lines else "*No items available right now.*"
+
+        wallet = await self.cog.get_wallet(self.ctx.author.id)
+        bank = await self.cog.get_bank(self.ctx.author.id)
+
+        embed.description = (
+            f"Hey there {self.ctx.author.mention}. You have reached the **Nuvella Shop** "
+            f"where you can use your Moon Dust to buy various items or perks. Feel free to "
+            f"click on **View More** for more information of any item and **Buy** to buy any "
+            f"item or perk you like.\n\n"
+            f"{BREAKER_LINE}\n"
+            f"**Please Note** — Once you buy an item, it cannot and will not be refunded back "
+            f"to you unless there happens to be a technical difficulty.\n"
+            f"{BREAKER_LINE}\n"
+            f"**Item List** —\n"
+            f"{item_block}\n"
+            f"{BREAKER_LINE}\n"
+            f"**Your Balance** —\n"
+            f"{EMOJIS['pouch']} Wallet: `{wallet:,}` Moon Dust\n"
+            f"{EMOJIS['bank']} Bank: `{bank:,}` Moon Dust\n"
+            f"{BREAKER_LINE}"
+        )
+
+        embed.set_footer(
+            text=f"Requested by {self.ctx.author}",
+            icon_url=self.ctx.author.display_avatar.url,
+        )
+        return embed
+
+    def _make_select(self, placeholder, callback):
+        items = self._all_items()
+        options = []
+        for name, item in items.items():
+            if len(options) >= 25:
+                break
+            label = self._display_name(name, item.get("custom", False))[:100]
+            try:
+                options.append(discord.SelectOption(
+                    label=label,
+                    description=f"{format_coins(item['price'])} Moon Dust",
+                    value=name,
+                    emoji=self._item_emoji(name),
+                ))
+            except Exception:
+                options.append(discord.SelectOption(
+                    label=label,
+                    description=f"{format_coins(item['price'])} Moon Dust",
+                    value=name,
+                ))
+        select = discord.ui.Select(placeholder=placeholder, options=options)
+        select.callback = callback
+        row = discord.ui.ActionRow()
+        row.add_item(select)
+        return row
+
+    def _back_row(self):
+        row = discord.ui.ActionRow()
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary,
+                                 emoji=EMOJIS.get("arrow_left", "◀"))
+        back.callback = self._back_to_main
+        row.add_item(back)
+        return row
+
+    def _build_main_buttons(self, clear: bool = True):
+        if clear:
+            self._clear_controls()
+        row = discord.ui.ActionRow()
+
+        buy_btn = discord.ui.Button(
+            label="Buy", style=discord.ButtonStyle.success,
+            emoji=EMOJIS.get("shopping_cart"))
+        buy_btn.callback = self._open_buy
+
+        view_btn = discord.ui.Button(
+            label="View More", style=discord.ButtonStyle.primary,
+            emoji=EMOJIS.get("package"))
+        view_btn.callback = self._open_info
+
+        exit_btn = discord.ui.Button(
+            label="Exit", style=discord.ButtonStyle.danger,
+            emoji=EMOJIS.get("cross"))
+        exit_btn.callback = self._exit
+
+        row.add_item(buy_btn)
+        row.add_item(view_btn)
+        row.add_item(exit_btn)
+        self.add_item(row)
+
+    def _build_buy_menu(self):
+        self._clear_controls()
+        self.add_item(self._make_select("Select an item to buy (1×)...", self._buy_select))
+        self.add_item(self._back_row())
+
+    def _build_info_menu(self):
+        self._clear_controls()
+        self.add_item(self._make_select("Select an item to view details...", self._info_select))
+        self.add_item(self._back_row())
+
+    async def _back_to_main(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+
+        await interaction.response.defer()
+        self._clear_controls()
+        self._build_main_buttons(clear=False)
+        embed = await self._shop_embed()
+        self.set_embed(embed)
+        prepare_v2_view(self, embed)
+        try:
+            await interaction.edit_original_response(view=self)
+        except discord.NotFound:
+            logging.getLogger("nuvella.economy").warning(
+                "Shop Back interaction expired | user_id=%s", interaction.user.id)
+
+    async def _open_buy(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+        await interaction.response.defer()
+        if not await self.cog.is_registered(self.ctx.author.id):
+            await interaction.followup.send(
+                "You need to register first! Use `+register`.", ephemeral=True)
+            return
+
+        self._build_buy_menu()
+
+        embed = discord.Embed(
+            title=f"{EMOJIS.get('shopping_cart', '🛒')} Buy an Item",
+            color=EMBED_COLOR,
+        )
+        if self.ctx.guild:
+            embed.set_author(name=self.ctx.guild.name,
+                             icon_url=self.ctx.guild.icon.url if self.ctx.guild.icon else None)
+        embed.description = (
+            f"{BREAKER_LINE}\n"
+            f"Pick an item from the dropdown to purchase **1×**.\n"
+            f"Custom shop items can only be bought one at a time.\n"
+            f"{BREAKER_LINE}"
+        )
+        embed.set_footer(text=f"Requested by {self.ctx.author}",
+                         icon_url=self.ctx.author.display_avatar.url)
+
+        self.set_embed(embed)
+        prepare_v2_view(self, embed)
+        await interaction.edit_original_response(view=self)
+
+    async def _open_info(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+
+        self._build_info_menu()
+
+        embed = discord.Embed(
+            title=f"{EMOJIS.get('package', '📦')} Item Information",
+            color=EMBED_COLOR,
+        )
+        if self.ctx.guild:
+            embed.set_author(name=self.ctx.guild.name,
+                             icon_url=self.ctx.guild.icon.url if self.ctx.guild.icon else None)
+        embed.description = (
+            f"{BREAKER_LINE}\n"
+            f"Pick an item from the dropdown to see its details.\n"
+            f"{BREAKER_LINE}"
+        )
+        embed.set_footer(text=f"Requested by {self.ctx.author}",
+                         icon_url=self.ctx.author.display_avatar.url)
+
+        self.set_embed(embed)
+        prepare_v2_view(self, embed)
+        await interaction.response.edit_message(view=self)
+
+    async def _buy_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+        if self._purchase_in_progress:
+            return await interaction.response.send_message("A purchase is already being processed.", ephemeral=True)
+        self._purchase_in_progress = True
+        item_name = interaction.data["values"][0]
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            log.warning("Shop buy selection interaction expired | user_id=%s", interaction.user.id)
+            self._purchase_in_progress = False
+            return
+        try:
+            result_embed_msg = await self.cog._process_purchase_interaction(interaction, item_name, 1)
+        except Exception:
+            logging.getLogger("nuvella.economy").exception(
+                "Shop purchase callback failed | user_id=%s | item=%s",
+                interaction.user.id, item_name,
+            )
+            result_embed_msg = error_embed_interaction(
+                interaction, "Purchase Failed", "The purchase could not be completed. Please try again later.")
+        self._clear_controls()
+        self.add_item(self._back_row())
+        self.set_embed(result_embed_msg)
+        prepare_v2_view(self, result_embed_msg)
+        self._purchase_in_progress = False
+        try:
+            await interaction.edit_original_response(view=self)
+        except discord.NotFound:
+            log.warning(
+                "Shop purchase response expired | user_id=%s | item=%s",
+                interaction.user.id, item_name,
+            )
+        except discord.HTTPException:
+            log.exception("Could not update shop purchase result | user_id=%s | item=%s", interaction.user.id, item_name)
+
+    async def _info_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+        item_name = interaction.data["values"][0]
+        items = self._all_items()
+        if item_name not in items:
+            return await interaction.response.send_message("Unknown item.", ephemeral=True)
+        item = items[item_name]
+        embed = discord.Embed(
+            title=f"{self._item_emoji(item_name)} {self._display_name(item_name, item.get('custom', False))}",
+            color=EMBED_COLOR,
+            timestamp=discord.utils.utcnow(),
+        )
+        if self.ctx.guild:
+            embed.set_author(name=self.ctx.guild.name,
+                             icon_url=self.ctx.guild.icon.url if self.ctx.guild.icon else None)
+        embed.description = (
+            f"{BREAKER_LINE}\n"
+            f"{item['description']}\n"
+            f"{BREAKER_LINE}"
+        )
+        embed.add_field(name="Price",
+                        value=f"`{format_coins(item['price'])}` Moon Dust", inline=True)
+        embed.add_field(name="Type",
+                        value=item.get("type", "consumable"), inline=True)
+        embed.add_field(name="Custom",
+                        value="Yes" if item.get("custom") else "No", inline=True)
+        embed.set_footer(text=f"Requested by {self.ctx.author}",
+                         icon_url=self.ctx.author.display_avatar.url)
+        self._clear_controls()
+        self.add_item(self._back_row())
+        self.set_embed(embed)
+        prepare_v2_view(self, embed)
+        await interaction.response.edit_message(view=self)
+
+    async def _exit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Not your shop!", ephemeral=True)
+        disable_all_components(self)
+        self.stop()
+        exit_embed = discord.Embed(
+            title=f"{EMOJIS.get('cross', '❌')} Shop Closed",
+            description="Thanks for visiting! Type `$shop` again to reopen.",
+            color=EMBED_COLOR,
+        )
+        self.set_embed(exit_embed)
+        await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self):
+        disable_all_components(self)
+        if hasattr(self, "message") and self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
 
 # ─── MAIN COG ────────────────────────────────────────────────
@@ -1102,14 +1406,11 @@ class Economy(commands.Cog):
         self.purge_broke_users.cancel()
         self.bank_interest.cancel()
         self.snapshot_balances.cancel()
-        # The pool is owned by the bot and shared by all cogs; do not close it here.
 
-    # ─── PERMISSION HELPERS ─────────────────────────────────
     def is_owner(self, user: discord.User) -> bool:
         return user.id == get_owner_id()
 
     def is_admin(self, user: discord.User) -> bool:
-        """Bot owner OR a member with the configured admin role."""
         if self.is_owner(user):
             return True
         if not isinstance(user, discord.Member):
@@ -1124,11 +1425,6 @@ class Economy(commands.Cog):
         return any(role.id in self.staff_role_ids for role in user.roles)
 
     async def _require_admin_silent(self, ctx) -> bool:
-        """Return True if the author is admin/owner.
-
-        Otherwise: silently delete the command message and return False,
-        with no response sent to the user.
-        """
         if self.is_admin(ctx.author):
             return True
         try:
@@ -1182,18 +1478,21 @@ class Economy(commands.Cog):
 
     def _load_shop_roles(self):
         mapping = {
-            "afk_permission": "afk_role_id",
-            "ghost_ping_viewer": "ghost_ping_role_id",
-            "tic_tac_toe": "ttt_role_id",
-            "rock_paper_scissors": "rps_role_id",
-            "eight_ball": "8ball_role_id",
-            "mafia_ping": "mafia_ping_role_id",
-            "roulette_ping": "roulette_ping_role_id",
+            "afk_permission": ("afk_role_id", "afk_perm"),
+            "ghost_ping_viewer": ("ghost_ping_role_id", "ghost_ping_perm"),
+            "tic_tac_toe": ("ttt_role_id", "ttt"),
+            "rock_paper_scissors": ("rps_role_id", "rps"),
+            "eight_ball": ("8ball_role_id", "8ball"),
+            "mafia_ping": ("mafia_ping_role_id", "mafia_ping"),
+            "roulette_ping": ("roulette_ping_role_id", "russian_roulette_ping"),
         }
-        for item_name, config_key in mapping.items():
-            role_id = ROLES_CONFIG.get(config_key)
+        for item_name, (config_key, legacy_key) in mapping.items():
+            role_id = ROLES_CONFIG.get(config_key) or CONFIG.get(legacy_key)
             if role_id:
-                self.shop_role_mapping[item_name] = int(role_id)
+                try:
+                    self.shop_role_mapping[item_name] = int(role_id)
+                except (TypeError, ValueError):
+                    pass
 
     def get_collect_amount(self, member: discord.Member) -> int:
         best = 0
@@ -1203,7 +1502,11 @@ class Economy(commands.Cog):
                 best = amt
         return best
 
-    # ─── DB Helper Methods ──────────────────────────────────────
+    async def _lock_economy_users(self, conn, *user_ids: int) -> None:
+        """Acquire per-user transaction locks in a stable order across economy mutations."""
+        for user_id in sorted({int(uid) for uid in user_ids if uid is not None}):
+            await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", user_id)
+
     async def _fetchval(self, query, *args):
         async with self.pool.acquire() as conn:
             return await conn.fetchval(query, *args)
@@ -1339,7 +1642,6 @@ class Economy(commands.Cog):
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_custom_shop_active ON custom_shop_items (active)")
                 await conn.execute("ANALYZE")
 
-    # ─── Custom Shop Methods ─────────────────────────────────────
     async def _load_custom_shop(self):
         rows = await self._fetch(
             "SELECT id, name, price, item_type, payload, description FROM custom_shop_items WHERE active = TRUE")
@@ -1351,18 +1653,20 @@ class Economy(commands.Cog):
             }
 
     async def _add_custom_shop_item(self, name, price, item_type, payload, description=""):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO custom_shop_items (name, price, item_type, payload, description) VALUES ($1,$2,$3,$4,$5)",
-                    name, price, item_type, payload, description
-                )
+        async def operation(conn):
+            await conn.execute(
+                "INSERT INTO custom_shop_items (name, price, item_type, payload, description) VALUES ($1,$2,$3,$4,$5)",
+                name, price, item_type, payload, description,
+            )
+
+        await run_transaction(self.pool, operation, label="economy.add_custom_shop_item")
         await self._load_custom_shop()
 
     async def _remove_custom_shop_item(self, name):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("UPDATE custom_shop_items SET active = FALSE WHERE name = $1", name)
+        async def operation(conn):
+            await conn.execute("UPDATE custom_shop_items SET active = FALSE WHERE name = $1", name)
+
+        await run_transaction(self.pool, operation, label="economy.remove_custom_shop_item")
         await self._load_custom_shop()
 
     async def _grant_custom_item(self, user_id, item_name):
@@ -1383,12 +1687,17 @@ class Economy(commands.Cog):
             return False
         payload = item['payload']
         item_type = item['type'].lower()
+        granted_role = None
+        role_was_already_present = False
         if item_type == "role":
             role_id = int(payload)
             role = guild.get_role(role_id)
             if role:
+                role_was_already_present = role in member.roles
                 try:
                     await member.add_roles(role, reason=f"Purchased from shop: {item_name}")
+                    if not role_was_already_present:
+                        granted_role = role
                 except discord.Forbidden:
                     return False
             else:
@@ -1397,15 +1706,34 @@ class Economy(commands.Cog):
             pass
         else:
             return False
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO user_custom_items (user_id, shop_item_id, purchased_at) SELECT $1, id, $2 FROM custom_shop_items WHERE name = $3 AND active = TRUE",
-                    user_id, int(time.time()), item_name
-                )
+        async def persist_purchase(conn):
+            inserted = await conn.fetchval(
+                """INSERT INTO user_custom_items (user_id, shop_item_id, purchased_at)
+                   SELECT $1, id, $2 FROM custom_shop_items WHERE name = $3 AND active = TRUE
+                   ON CONFLICT (user_id, shop_item_id) DO NOTHING
+                   RETURNING user_id""",
+                user_id, int(time.time()), item_name,
+            )
+            return inserted is not None
+
+        try:
+            saved = await run_transaction(self.pool, persist_purchase, label="economy.persist_custom_item_purchase")
+        except Exception:
+            if granted_role is not None:
+                try:
+                    await member.remove_roles(granted_role, reason="Custom item purchase persistence failed")
+                except (discord.Forbidden, discord.HTTPException):
+                    log.exception("Could not roll back unrecorded custom item role | user_id=%s", user_id)
+            raise
+        if not saved:
+            if granted_role is not None:
+                try:
+                    await member.remove_roles(granted_role, reason="Custom item purchase persistence failed")
+                except (discord.Forbidden, discord.HTTPException):
+                    log.exception("Could not roll back unrecorded custom item role | user_id=%s", user_id)
+            return False
         return True
 
-    # ─── Atomic Economy DB helpers ──────────────────────────────
     async def get_wallet(self, uid):
         row = await self._fetchrow("SELECT wallet FROM users WHERE id=$1", uid)
         return row['wallet'] if row else 0
@@ -1418,200 +1746,361 @@ class Economy(commands.Cog):
         return await self._fetchval("SELECT 1 FROM registered_users WHERE user_id=$1", uid) is not None
 
     async def register_user(self, uid, starting_wallet=1000) -> bool:
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                inserted = await conn.fetchval(
-                    "INSERT INTO registered_users (user_id, registered_at) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING RETURNING user_id",
-                    uid, int(time.time())
-                )
-                if inserted is None:
-                    return False
-                await conn.execute(
-                    "INSERT INTO users (id, wallet) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
-                    uid, starting_wallet
-                )
-                return True
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            inserted = await conn.fetchval(
+                "INSERT INTO registered_users (user_id, registered_at) VALUES ($1, $2) "
+                "ON CONFLICT (user_id) DO NOTHING RETURNING user_id",
+                uid, int(time.time()),
+            )
+            if inserted is None:
+                return False
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, $2, 0) ON CONFLICT (id) DO NOTHING",
+                uid, starting_wallet,
+            )
+            return True
+
+        return await run_transaction(self.pool, operation, label="economy.register_user")
 
     async def add_wallet(self, uid, amount):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if amount >= 0:
-                    await conn.execute(
-                        "INSERT INTO users (id, wallet) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
-                    return await conn.fetchval(
-                        "UPDATE users SET wallet = wallet + $1 WHERE id = $2 RETURNING wallet",
-                        amount, uid)
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            if amount >= 0:
+                await conn.execute(
+                    "INSERT INTO users (id, wallet) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid
+                )
                 return await conn.fetchval(
-                    "UPDATE users SET wallet = wallet - $1 WHERE id = $2 AND wallet >= $1 RETURNING wallet",
-                    -amount, uid)
+                    "UPDATE users SET wallet = wallet + $1 WHERE id = $2 RETURNING wallet", amount, uid
+                )
+            return await conn.fetchval(
+                "UPDATE users SET wallet = wallet - $1 WHERE id = $2 AND wallet >= $1 RETURNING wallet",
+                -amount, uid,
+            )
+
+        return await run_transaction(self.pool, operation, label="economy.add_wallet")
 
     async def add_bank(self, uid, amount):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if amount >= 0:
-                    await conn.execute(
-                        "INSERT INTO users (id, bank) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
-                    return await conn.fetchval(
-                        "UPDATE users SET bank = bank + $1 WHERE id = $2 RETURNING bank",
-                        amount, uid)
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            if amount >= 0:
+                await conn.execute(
+                    "INSERT INTO users (id, bank) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid
+                )
                 return await conn.fetchval(
-                    "UPDATE users SET bank = bank - $1 WHERE id = $2 AND bank >= $1 RETURNING bank",
-                    -amount, uid)
+                    "UPDATE users SET bank = bank + $1 WHERE id = $2 RETURNING bank", amount, uid
+                )
+            return await conn.fetchval(
+                "UPDATE users SET bank = bank - $1 WHERE id = $2 AND bank >= $1 RETURNING bank",
+                -amount, uid,
+            )
+
+        return await run_transaction(self.pool, operation, label="economy.add_bank")
 
     async def move_wallet_to_bank(self, uid, amount):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING", uid)
-                return await conn.fetchrow(
-                    """UPDATE users SET wallet = wallet - $1, bank = bank + $1
-                       WHERE id = $2 AND wallet >= $1 RETURNING wallet, bank""",
-                    amount, uid)
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING", uid
+            )
+            return await conn.fetchrow(
+                """UPDATE users SET wallet = wallet - $1, bank = bank + $1
+                   WHERE id = $2 AND wallet >= $1 RETURNING wallet, bank""",
+                amount, uid,
+            )
+
+        return await run_transaction(self.pool, operation, label="economy.move_wallet_to_bank")
 
     async def move_bank_to_wallet(self, uid, amount):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING", uid)
-                return await conn.fetchrow(
-                    """UPDATE users SET bank = bank - $1, wallet = wallet + $1
-                       WHERE id = $2 AND bank >= $1 RETURNING wallet, bank""",
-                    amount, uid)
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING", uid
+            )
+            return await conn.fetchrow(
+                """UPDATE users SET bank = bank - $1, wallet = wallet + $1
+                   WHERE id = $2 AND bank >= $1 RETURNING wallet, bank""",
+                amount, uid,
+            )
+
+        return await run_transaction(self.pool, operation, label="economy.move_bank_to_wallet")
 
     async def transfer_wallet(self, from_id, to_id, amount):
-        first_id, second_id = sorted((from_id, to_id))
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.fetchrow("SELECT id FROM users WHERE id = $1 FOR UPDATE", first_id)
-                await conn.fetchrow("SELECT id FROM users WHERE id = $1 FOR UPDATE", second_id)
-                row = await conn.fetchrow(
-                    "UPDATE users SET wallet = wallet - $1 WHERE id = $2 AND wallet >= $1 RETURNING wallet",
-                    amount, from_id)
-                if row is None:
-                    return None
-                await conn.execute(
-                    "UPDATE users SET wallet = wallet + $1 WHERE id = $2", amount, to_id)
-                return row['wallet']
+        if from_id == to_id or amount <= 0:
+            return None
+
+        async def operation(conn):
+            await self._lock_economy_users(conn, from_id, to_id)
+            locked = set()
+            for user_id in sorted((from_id, to_id)):
+                row = await conn.fetchrow("SELECT id FROM users WHERE id = $1 FOR UPDATE", user_id)
+                if row:
+                    locked.add(user_id)
+            if locked != {from_id, to_id}:
+                return None
+            row = await conn.fetchrow(
+                "UPDATE users SET wallet = wallet - $1 WHERE id = $2 AND wallet >= $1 RETURNING wallet",
+                amount, from_id,
+            )
+            if row is None:
+                return None
+            credited = await conn.fetchval(
+                "UPDATE users SET wallet = wallet + $1 WHERE id = $2 RETURNING wallet", amount, to_id
+            )
+            if credited is None:
+                # Defensive guard; transaction rollback prevents money disappearing.
+                raise RuntimeError("Recipient account disappeared during a locked wallet transfer")
+            return row["wallet"]
+
+        return await run_transaction(self.pool, operation, label="economy.transfer_wallet")
+
+    async def _atomic_wallet_transfer(self, from_id, to_id, amount):
+        """Atomically move currency between users in a deterministic lock order."""
+        if from_id == to_id or amount <= 0:
+            return None
+
+        async def operation(conn):
+            await self._lock_economy_users(conn, from_id, to_id)
+            locked = set()
+            for user_id in sorted((from_id, to_id)):
+                row = await conn.fetchrow("SELECT id FROM users WHERE id = $1 FOR UPDATE", user_id)
+                if row:
+                    locked.add(user_id)
+            if locked != {from_id, to_id}:
+                return None
+            src = await conn.fetchrow(
+                "UPDATE users SET wallet = wallet - $1 WHERE id = $2 AND wallet >= $1 RETURNING wallet",
+                amount, from_id,
+            )
+            if src is None:
+                return None
+            dst = await conn.fetchrow(
+                "UPDATE users SET wallet = wallet + $1 WHERE id = $2 RETURNING wallet", amount, to_id
+            )
+            if dst is None:
+                raise RuntimeError("Destination account disappeared during a locked transfer")
+            return src["wallet"], dst["wallet"]
+
+        return await run_transaction(self.pool, operation, label="economy.atomic_wallet_transfer")
 
     async def set_wallet(self, uid, amount):
-        if amount < 0:
-            amount = 0
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("INSERT INTO users (id, wallet) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
-                await conn.execute("UPDATE users SET wallet = $1 WHERE id=$2", amount, uid)
+        amount = max(0, int(amount))
+
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            await conn.execute("INSERT INTO users (id, wallet) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
+            await conn.execute("UPDATE users SET wallet = $1 WHERE id=$2", amount, uid)
+
+        await run_transaction(self.pool, operation, label="economy.set_wallet")
 
     async def set_bank(self, uid, amount):
-        if amount < 0:
-            amount = 0
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("INSERT INTO users (id, bank) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
-                await conn.execute("UPDATE users SET bank = $1 WHERE id=$2", amount, uid)
+        amount = max(0, int(amount))
+
+        async def operation(conn):
+            await self._lock_economy_users(conn, uid)
+            await conn.execute("INSERT INTO users (id, bank) VALUES ($1, 0) ON CONFLICT (id) DO NOTHING", uid)
+            await conn.execute("UPDATE users SET bank = $1 WHERE id=$2", amount, uid)
+
+        await run_transaction(self.pool, operation, label="economy.set_bank")
 
     async def has_item_equipped(self, user_id, item_name):
         return await self._fetchval("SELECT 1 FROM equipped WHERE user_id=$1 AND item=$2",
                                     user_id, item_name) is not None
 
     async def consume_item(self, user_id, item_name):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM equipped WHERE user_id=$1 AND item=$2", user_id, item_name)
-                await conn.execute("UPDATE inventory SET qty = qty - 1 WHERE user_id=$1 AND item=$2",
-                                   user_id, item_name)
-                await conn.execute("DELETE FROM inventory WHERE user_id=$1 AND item=$2 AND qty <= 0",
-                                   user_id, item_name)
+        async def operation(conn):
+            await self._lock_economy_users(conn, user_id)
+            # Lock/update inventory deterministically; do not decrement below zero.
+            row = await conn.fetchrow(
+                "UPDATE inventory SET qty = qty - 1 WHERE user_id=$1 AND item=$2 AND qty > 0 RETURNING qty",
+                user_id, item_name,
+            )
+            if row is None:
+                return False
+            await conn.execute("DELETE FROM equipped WHERE user_id=$1 AND item=$2", user_id, item_name)
+            await conn.execute("DELETE FROM inventory WHERE user_id=$1 AND item=$2 AND qty <= 0", user_id, item_name)
+            return True
+
+        return await run_transaction(self.pool, operation, label="economy.consume_item")
 
     async def add_item(self, user_id, item_name, quantity):
-        await self._execute(
-            """INSERT INTO inventory (user_id, item, qty) VALUES ($1, $2, $3)
-               ON CONFLICT (user_id, item) DO UPDATE SET qty = inventory.qty + EXCLUDED.qty""",
-            user_id, item_name, quantity)
+        async def operation(conn):
+            await self._lock_economy_users(conn, user_id)
+            await conn.execute(
+                """INSERT INTO inventory (user_id, item, qty) VALUES ($1, $2, $3)
+                   ON CONFLICT (user_id, item) DO UPDATE SET qty = inventory.qty + EXCLUDED.qty""",
+                user_id, item_name, quantity,
+            )
+
+        await run_transaction(self.pool, operation, label="economy.add_item")
 
     async def require_registered(self, ctx) -> bool:
-        if await self.is_registered(ctx.author.id):
-            return True
-        embed = error_embed(ctx, "Not Registered",
-                            "You need to open an account first! Use `!register` to get started.")
-        await ctx.send(embed=embed)
-        return False
+        if not await self.is_registered(ctx.author.id):
+            embed = error_embed(ctx, "Not Registered",
+                                "You need to open an account first! Use `$register` to get started.")
+            await ctx.send(embed=embed)
+            return False
+        await self.add_wallet(ctx.author.id, 0)
+        return True
 
     # ─── LOGGING ────────────────────────────────────────────────
+    def _is_read_only(self, ctx) -> bool:
+        """True if the invoked command (or its root group) is read-only."""
+        name = ctx.command.qualified_name or ""
+        root = name.split()[0]
+        return root in READ_ONLY_COMMANDS
+
     async def log_command_use(self, ctx, start_wallet=None, start_bank=None):
         if not LOGGING_CONFIG.get("command_logging", True):
             return
-        now_wallet = await self.get_wallet(ctx.author.id)
-        now_bank = await self.get_bank(ctx.author.id)
+
+        # Single atomic read of wallet + bank. Previously two separate
+        # connections could observe a torn state if a concurrent transaction
+        # was moving money between wallet and bank.
+        row = await self._fetchrow(
+            "SELECT COALESCE(wallet, 0) AS wallet, COALESCE(bank, 0) AS bank "
+            "FROM users WHERE id = $1",
+            ctx.author.id,
+        )
+        now_wallet = row["wallet"] if row else 0
+        now_bank = row["bank"] if row else 0
+
         if start_wallet is None:
             start_wallet = now_wallet
         if start_bank is None:
             start_bank = now_bank
-        delta_wallet = now_wallet - start_wallet
-        delta_bank = now_bank - start_bank
-        delta_total = (now_wallet + now_bank) - (start_wallet + start_bank)
-        await log_to_discord(
-            self.bot,
-            f"{EMOJIS['chart']} **Economy Log** {EMOJIS['chart']}\n"
-            f"**User:** {ctx.author} (`{ctx.author.id}`)\n"
-            f"**Command:** `{ctx.command.qualified_name}`\n"
-            f"**Channel:** {ctx.channel.mention} (`{ctx.channel.id}`)\n"
-            f"**Guild:** {ctx.guild.name if ctx.guild else 'DM'}\n"
-            f"**Opening {EMOJIS['pouch']} Wallet:** `{start_wallet:,}` Moon Dust\n"
-            f"**Opening {EMOJIS['bank']} Bank:** `{start_bank:,}` Moon Dust\n"
-            f"**Closing {EMOJIS['pouch']} Wallet:** `{now_wallet:,}` Moon Dust\n"
-            f"**Closing {EMOJIS['bank']} Bank:** `{now_bank:,}` Moon Dust\n"
-            f"**Delta {EMOJIS['pouch']} Wallet:** `{delta_wallet:+,}`\n"
-            f"**Delta {EMOJIS['bank']} Bank:** `{delta_bank:+,}`\n"
-            f"**Delta {EMOJIS['diamond']} Net:** `{delta_total:+,}`"
+
+        prev_total = start_wallet + start_bank
+        curr_total = now_wallet + now_bank
+
+        embed = discord.Embed(
+            title=f"{EMOJIS['chart']} Economy Log",
+            color=EMBED_COLOR,
+            timestamp=discord.utils.utcnow(),
         )
+        embed.set_author(name=str(ctx.author), icon_url=ctx.author.display_avatar.url)
+
+        channel_value = ctx.channel.mention if ctx.guild else f"DM ({ctx.channel.id})"
+        guild_value = ctx.guild.name if ctx.guild else "DM"
+
+        embed.add_field(
+            name="User",
+            value=f"{ctx.author.display_name} (ID: {ctx.author.id})",
+            inline=False,
+        )
+        embed.add_field(
+            name="Command",
+            value=f"`{ctx.command.qualified_name}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Channel",
+            value=channel_value,
+            inline=False,
+        )
+        embed.add_field(
+            name="Previous Balance",
+            value=f"`{prev_total:,}` Moon Dust",
+            inline=False,
+        )
+        embed.add_field(
+            name="Current Balance",
+            value=f"`{curr_total:,}` Moon Dust",
+            inline=False,
+        )
+        embed.add_field(
+            name="Guild",
+            value=guild_value,
+            inline=False,
+        )
+
+        await log_embed_to_discord(self.bot, embed)
 
     # ─── BROKE-USER PURGE ──────────────────────────────────────
     async def check_broke(self, user_id: int):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT wallet, bank FROM users WHERE id = $1 FOR UPDATE", user_id)
-                if row is None or row["wallet"] != 0 or row["bank"] != 0:
-                    return
-                await conn.execute(
-                    """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
-                       VALUES ($1, $2, $3, $4, $5)
-                       ON CONFLICT (user_id) DO UPDATE SET
-                           last_wallet = EXCLUDED.last_wallet,
-                           last_bank = EXCLUDED.last_bank,
-                           reason = EXCLUDED.reason,
-                           purged_at = EXCLUDED.purged_at""",
-                    user_id, 0, 0, "broke (wallet & bank both 0)", int(time.time()))
-                await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+        # Mid-game accounts can temporarily be zeroed while winnings are pending.
+        if user_id in self.active_games:
+            return
 
-    # ─── TASKS ───────────────────────────────────────────────────
+        async def operation(conn):
+            await self._lock_economy_users(conn, user_id)
+            row = await conn.fetchrow(
+                "SELECT wallet, bank FROM users WHERE id = $1 FOR UPDATE", user_id
+            )
+            if row is None or row["wallet"] != 0 or row["bank"] != 0:
+                return False
+            await conn.execute(
+                """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (user_id) DO UPDATE SET
+                       last_wallet = EXCLUDED.last_wallet,
+                       last_bank = EXCLUDED.last_bank,
+                       reason = EXCLUDED.reason,
+                       purged_at = EXCLUDED.purged_at""",
+                user_id, 0, 0, "broke (wallet & bank both 0)", int(time.time()),
+            )
+            await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+            return True
+
+        await run_transaction(self.pool, operation, label="economy.check_broke")
+
     @tasks.loop(hours=1)
     async def purge_broke_users(self):
         await self.bot.wait_until_ready()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE wallet = 0 AND bank = 0")
-                if count == 0:
-                    return
-                await conn.execute(
-                    """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
-                       SELECT id, wallet, bank, 'broke (wallet & bank both 0) — periodic sweep', $1
-                       FROM users WHERE wallet = 0 AND bank = 0
-                       ON CONFLICT (user_id) DO UPDATE SET
-                           last_wallet = EXCLUDED.last_wallet,
-                           last_bank = EXCLUDED.last_bank,
-                           reason = EXCLUDED.reason,
-                           purged_at = EXCLUDED.purged_at""",
-                    int(time.time()))
-                await conn.execute("DELETE FROM inventory WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM equipped WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM custom_roles WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM left_users WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM balance_snapshots WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM user_custom_items WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM command_cooldowns WHERE user_id IN (SELECT id FROM users WHERE wallet = 0 AND bank = 0)")
-                await conn.execute("DELETE FROM users WHERE wallet = 0 AND bank = 0")
-        await log_to_discord(self.bot, f"Periodic sweep purged {count} broke account(s).")
+        active = list(self.active_games) or [0]
+        total_purged = 0
+
+        async def purge_batch(conn):
+            candidates = await conn.fetch(
+                """SELECT id FROM users
+                   WHERE wallet = 0 AND bank = 0 AND id != ALL($1::bigint[])
+                   ORDER BY id LIMIT 500""",
+                active,
+            )
+            candidate_ids = [row["id"] for row in candidates]
+            if not candidate_ids:
+                return 0
+            await self._lock_economy_users(conn, *candidate_ids)
+            rows = await conn.fetch(
+                """SELECT id, wallet, bank FROM users
+                   WHERE id = ANY($1::bigint[]) AND wallet = 0 AND bank = 0
+                   ORDER BY id FOR UPDATE""",
+                candidate_ids,
+            )
+            ids = [row["id"] for row in rows]
+            if not ids:
+                # A balance changed while locks were being acquired; rescan rather than
+                # leaving later eligible accounts behind for the next scheduled sweep.
+                return -1
+            await conn.execute(
+                """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
+                   SELECT id, wallet, bank, 'broke (wallet & bank both 0) — periodic sweep', $1
+                   FROM users WHERE id = ANY($2::bigint[])
+                   ON CONFLICT (user_id) DO UPDATE SET
+                       last_wallet = EXCLUDED.last_wallet,
+                       last_bank = EXCLUDED.last_bank,
+                       reason = EXCLUDED.reason,
+                       purged_at = EXCLUDED.purged_at""",
+                int(time.time()), ids,
+            )
+            # Delete dependent rows in a stable order before deleting their users.
+            for table in (
+                "inventory", "equipped", "custom_roles", "left_users",
+                "balance_snapshots", "user_custom_items", "command_cooldowns",
+            ):
+                await conn.execute(f"DELETE FROM {table} WHERE user_id = ANY($1::bigint[])", ids)
+            await conn.execute("DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
+            return len(ids)
+
+        while True:
+            count = await run_transaction(self.pool, purge_batch, label="economy.purge_broke_users")
+            if count < 0:
+                continue
+            total_purged += count
+            if count == 0:
+                break
+        if total_purged:
+            await log_to_discord(self.bot, f"Periodic sweep purged {total_purged} broke account(s).")
 
     @purge_broke_users.before_loop
     async def before_purge_broke_users(self):
@@ -1621,12 +2110,15 @@ class Economy(commands.Cog):
     async def snapshot_balances(self):
         await self.bot.wait_until_ready()
         now = int(time.time())
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO balance_snapshots (user_id, taken_at, wallet, bank) SELECT id, $1, wallet, bank FROM users",
-                    now)
-                await conn.execute("DELETE FROM balance_snapshots WHERE taken_at < $1", now - (35 * 86400))
+
+        async def operation(conn):
+            await conn.execute(
+                "INSERT INTO balance_snapshots (user_id, taken_at, wallet, bank) SELECT id, $1, wallet, bank FROM users",
+                now,
+            )
+            await conn.execute("DELETE FROM balance_snapshots WHERE taken_at < $1", now - (35 * 86400))
+
+        await run_transaction(self.pool, operation, label="economy.snapshot_balances")
 
     @snapshot_balances.before_loop
     async def before_snapshot_balances(self):
@@ -1635,9 +2127,23 @@ class Economy(commands.Cog):
     @tasks.loop(hours=1)
     async def bank_interest(self):
         await self.bot.wait_until_ready()
-        count = await self._fetchval("SELECT COUNT(*) FROM users WHERE bank > 0")
+
+        async def operation(conn):
+            rows = await conn.fetch("SELECT id FROM users WHERE bank > 0 ORDER BY id")
+            user_ids = [row["id"] for row in rows]
+            if not user_ids:
+                return 0
+            await self._lock_economy_users(conn, *user_ids)
+            updated = await conn.fetchval(
+                """WITH changed AS (
+                       UPDATE users SET bank = bank + LEAST(bank / 50, 10000) WHERE bank > 0
+                       RETURNING id
+                   ) SELECT COUNT(*) FROM changed"""
+            )
+            return int(updated or 0)
+
+        count = await run_transaction(self.pool, operation, label="economy.bank_interest")
         if count:
-            await self._execute("UPDATE users SET bank = bank + LEAST(bank / 50, 10000) WHERE bank > 0")
             await log_to_discord(self.bot, f"Bank interest applied to {count} accounts.")
 
     @bank_interest.before_loop
@@ -1655,11 +2161,21 @@ class Economy(commands.Cog):
             if guild:
                 member = guild.get_member(user_id)
                 role = guild.get_role(role_id)
-                if member and role:
+                if member and role and role in member.roles:
                     try:
-                        await member.remove_roles(role, reason="Custom role expired")
+                        await member.remove_roles(role, reason="Shop custom role expired")
                     except (discord.Forbidden, discord.HTTPException):
-                        pass
+                        logging.getLogger("nuvella.roles").exception(
+                            "Could not remove expired custom role | guild_id=%s | user_id=%s | role_id=%s",
+                            guild_id, user_id, role_id,
+                        )
+                if role and role.name.startswith("Custom · "):
+                    try:
+                        await role.delete(reason="Shop custom role expired")
+                    except (discord.Forbidden, discord.HTTPException):
+                        logging.getLogger("nuvella.roles").exception(
+                            "Could not delete expired custom role | guild_id=%s | role_id=%s", guild_id, role_id
+                        )
             await self._execute("DELETE FROM custom_roles WHERE user_id=$1 AND guild_id=$2", user_id, guild_id)
 
     @custom_role_check.before_loop
@@ -1670,36 +2186,65 @@ class Economy(commands.Cog):
     async def purge_left_users(self):
         await self.bot.wait_until_ready()
         now = int(time.time())
-        rows = []
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    "SELECT user_id FROM left_users WHERE left_at < $1 FOR UPDATE", now - 86400)
-                for (user_id,) in rows:
-                    row = await conn.fetchrow(
-                        "SELECT wallet, bank FROM users WHERE id = $1 FOR UPDATE", user_id)
-                    if row:
-                        await conn.execute(
-                            """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
-                               VALUES ($1, $2, $3, $4, $5)
-                               ON CONFLICT (user_id) DO UPDATE SET
-                                   last_wallet = EXCLUDED.last_wallet,
-                                   last_bank = EXCLUDED.last_bank,
-                                   reason = EXCLUDED.reason,
-                                   purged_at = EXCLUDED.purged_at""",
-                            user_id, row['wallet'], row['bank'],
-                            "left server (24h grace period expired)", now)
-                        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
-                        await conn.execute("DELETE FROM inventory WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM equipped WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM custom_roles WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM left_users WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM balance_snapshots WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM user_custom_items WHERE user_id = $1", user_id)
-                        await conn.execute("DELETE FROM command_cooldowns WHERE user_id = $1", user_id)
-        if rows:
-            await log_to_discord(self.bot,
-                                 f"Purged economy data for {len(rows)} user(s) who left and didn't return within 24h.")
+
+        async def operation(conn):
+            candidates = await conn.fetch(
+                "SELECT user_id FROM left_users WHERE left_at < $1 ORDER BY user_id LIMIT 500",
+                now - 86400,
+            )
+            candidate_ids = [row["user_id"] for row in candidates]
+            if not candidate_ids:
+                return 0
+            await self._lock_economy_users(conn, *candidate_ids)
+            rows = await conn.fetch(
+                """SELECT user_id FROM left_users
+                   WHERE user_id = ANY($1::bigint[]) AND left_at < $2
+                   ORDER BY user_id FOR UPDATE""",
+                candidate_ids, now - 86400,
+            )
+            ids = [row["user_id"] for row in rows]
+            if not ids:
+                return -1
+            accounts = await conn.fetch(
+                "SELECT id, wallet, bank FROM users WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE",
+                ids,
+            )
+            balances = {row["id"]: row for row in accounts}
+            for user_id in ids:
+                row = balances.get(user_id)
+                if row:
+                    await conn.execute(
+                        """INSERT INTO purged_accounts (user_id, last_wallet, last_bank, reason, purged_at)
+                           VALUES ($1, $2, $3, $4, $5)
+                           ON CONFLICT (user_id) DO UPDATE SET
+                               last_wallet = EXCLUDED.last_wallet,
+                               last_bank = EXCLUDED.last_bank,
+                               reason = EXCLUDED.reason,
+                               purged_at = EXCLUDED.purged_at""",
+                        user_id, row["wallet"], row["bank"],
+                        "left server (24h grace period expired)", now,
+                    )
+            for table in (
+                "inventory", "equipped", "custom_roles", "left_users",
+                "balance_snapshots", "user_custom_items", "command_cooldowns",
+            ):
+                await conn.execute(f"DELETE FROM {table} WHERE user_id = ANY($1::bigint[])", ids)
+            await conn.execute("DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
+            return len(ids)
+
+        total = 0
+        while True:
+            count = await run_transaction(self.pool, operation, label="economy.purge_left_users")
+            if count < 0:
+                continue
+            total += count
+            if count == 0:
+                break
+        if total:
+            await log_to_discord(
+                self.bot,
+                f"Purged economy data for {total} user(s) who left and didn't return within 24h.",
+            )
 
     @purge_left_users.before_loop
     async def before_purge_left_users(self):
@@ -1782,31 +2327,35 @@ class Economy(commands.Cog):
 
     @commands.Cog.listener()
     async def on_command_completion(self, ctx):
-        if ctx.cog is self and self.pool is not None:
-            start_wallet = getattr(ctx, '_starting_wallet', None)
-            start_bank = getattr(ctx, '_starting_bank', None)
-            await self.log_command_use(ctx, start_wallet, start_bank)
+        if ctx.cog is not self or self.pool is None:
+            return
+        if self._is_read_only(ctx):
+            return
+        start_wallet = getattr(ctx, '_starting_wallet', None)
+        start_bank = getattr(ctx, '_starting_bank', None)
+        await self.log_command_use(ctx, start_wallet, start_bank)
+        if ctx.author.id not in self.active_games:
             await self.check_broke(ctx.author.id)
-            if LOGGING_CONFIG.get("reply_on_command", False):
-                now_wallet = await self.get_wallet(ctx.author.id)
-                now_bank = await self.get_bank(ctx.author.id)
-                embed = discord.Embed(
-                    title=f"{EMOJIS['tick']} Command Executed",
-                    description=f"`{ctx.command.qualified_name}` completed.",
-                    color=EMBED_COLOR)
-                embed.add_field(name=f"{EMOJIS['pouch']} Starting Wallet",
-                                value=f"`{start_wallet if start_wallet is not None else 'N/A'}` Moon Dust", inline=True)
-                embed.add_field(name=f"{EMOJIS['pouch']} Ending Wallet",
-                                value=f"`{now_wallet}` Moon Dust", inline=True)
-                embed.add_field(name=f"{EMOJIS['bank']} Starting Bank",
-                                value=f"`{start_bank if start_bank is not None else 'N/A'}` Moon Dust", inline=True)
-                embed.add_field(name=f"{EMOJIS['bank']} Ending Bank",
-                                value=f"`{now_bank}` Moon Dust", inline=True)
-                embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-                try:
-                    await ctx.send(embed=embed)
-                except discord.HTTPException:
-                    pass
+        if LOGGING_CONFIG.get("reply_on_command", False):
+            now_wallet = await self.get_wallet(ctx.author.id)
+            now_bank = await self.get_bank(ctx.author.id)
+            embed = discord.Embed(
+                title=f"{EMOJIS['tick']} Command Executed",
+                description=f"`{ctx.command.qualified_name}` completed.",
+                color=EMBED_COLOR)
+            embed.add_field(name=f"{EMOJIS['pouch']} Starting Wallet",
+                            value=f"`{start_wallet if start_wallet is not None else 'N/A'}` Moon Dust", inline=True)
+            embed.add_field(name=f"{EMOJIS['pouch']} Ending Wallet",
+                            value=f"`{now_wallet}` Moon Dust", inline=True)
+            embed.add_field(name=f"{EMOJIS['bank']} Starting Bank",
+                            value=f"`{start_bank if start_bank is not None else 'N/A'}` Moon Dust", inline=True)
+            embed.add_field(name=f"{EMOJIS['bank']} Ending Bank",
+                            value=f"`{now_bank}` Moon Dust", inline=True)
+            embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+            try:
+                await ctx.send(embed=embed)
+            except discord.HTTPException:
+                pass
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -1847,7 +2396,7 @@ class Economy(commands.Cog):
             ctx.author.id, ctx.channel.id)
         if bypass:
             return True
-        if ALLOWED_CHANNEL_ID and ctx.channel.id == ALLOWED_CHANNEL_ID:
+        if not ALLOWED_CHANNEL_ID or ctx.channel.id == ALLOWED_CHANNEL_ID:
             return True
         if ctx.message:
             try:
@@ -1858,23 +2407,33 @@ class Economy(commands.Cog):
 
     # ─── PERSISTENT COOLDOWNS ─────────────────────────────────
     async def get_db_cooldown(self, user_id: int, command: str, seconds: int):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT last_used FROM command_cooldowns WHERE user_id = $1 AND command = $2 FOR UPDATE",
-                    user_id, command)
-                now = int(time.time())
-                if row and now - row['last_used'] < seconds:
-                    return seconds - (now - row['last_used'])
-                await conn.execute(
-                    """INSERT INTO command_cooldowns (user_id, command, last_used)
-                       VALUES ($1, $2, $3)
-                       ON CONFLICT (user_id, command)
-                       DO UPDATE SET last_used = EXCLUDED.last_used""",
-                    user_id, command, now)
-                return None
+        """Atomically reserve a persistent cooldown while coordinating with account purges."""
+        async def operation(conn):
+            await self._lock_economy_users(conn, user_id)
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING",
+                user_id,
+            )
+            parent = await conn.fetchval("SELECT id FROM users WHERE id = $1 FOR UPDATE", user_id)
+            if parent is None:
+                raise RuntimeError("Could not ensure economy account for cooldown")
+            row = await conn.fetchrow(
+                "SELECT last_used FROM command_cooldowns WHERE user_id = $1 AND command = $2 FOR UPDATE",
+                user_id, command,
+            )
+            now = int(time.time())
+            if row and now - row["last_used"] < seconds:
+                return seconds - (now - row["last_used"])
+            await conn.execute(
+                """INSERT INTO command_cooldowns (user_id, command, last_used)
+                   VALUES ($1, $2, $3) ON CONFLICT (user_id, command)
+                   DO UPDATE SET last_used = EXCLUDED.last_used""",
+                user_id, command, now,
+            )
+            return None
 
-    # ─── GAME RESERVATION HELPER ───────────────────────────────
+        return await run_transaction(self.pool, operation, label="economy.get_db_cooldown")
+
     async def try_start_game(self, user_id: int) -> bool:
         async with user_lock(user_id):
             if user_id in self.active_games:
@@ -1890,7 +2449,7 @@ class Economy(commands.Cog):
         if not new_user:
             return await ctx.send(embed=error_embed(
                 ctx, "Already Registered",
-                "You already have an account! Use `!balance` to check your Moon Dust."))
+                "You already have an account! Use `$balance` to check your Moon Dust."))
         await self._execute(
             "INSERT INTO balance_snapshots (user_id, taken_at, wallet, bank) VALUES ($1,$2,$3,$4)",
             ctx.author.id, int(time.time()), 1000, 0)
@@ -1907,7 +2466,6 @@ class Economy(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    # ─── ADMIN: REGISTERED USERS (silent for non-admins) ────────
     @commands.command(name="registeredusers", aliases=["totalusers", "regcount"])
     async def registered_users(self, ctx: commands.Context):
         """View the total number of registered economy users. Admin only."""
@@ -1928,23 +2486,36 @@ class Economy(commands.Cog):
         if amount <= 0:
             return await ctx.send(embed=error_embed(
                 ctx, "No Collect Role", "You don't have a role eligible for collect."))
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT last_collected FROM collect_cooldowns WHERE user_id=$1 FOR UPDATE", user_id)
-                now = int(time.time())
-                if row and now - row['last_collected'] < 86400:
-                    remaining = 86400 - (now - row['last_collected'])
-                    await ctx.send(embed=cooldown_embed(ctx, remaining))
-                    return
-                await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", user_id)
-                await conn.execute("UPDATE users SET wallet = wallet + $1 WHERE id=$2", amount, user_id)
-                await conn.execute(
-                    "INSERT INTO collect_cooldowns (user_id, last_collected) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET last_collected = EXCLUDED.last_collected",
-                    user_id, now)
-                wallet = await conn.fetchval("SELECT wallet FROM users WHERE id=$1", user_id)
-        embed = result_embed(ctx, f"{EMOJIS['gift']} Collect", f"You collected **{amount:,}** Moon Dust!", win=True)
-        embed.add_field(name="Wallet", value=f"`{wallet:,}` Moon Dust", inline=False)
+
+        async def operation(conn):
+            await self._lock_economy_users(conn, user_id)
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING",
+                user_id,
+            )
+            await conn.fetchval("SELECT id FROM users WHERE id=$1 FOR UPDATE", user_id)
+            row = await conn.fetchrow(
+                "SELECT last_collected FROM collect_cooldowns WHERE user_id=$1 FOR UPDATE", user_id
+            )
+            now = int(time.time())
+            if row and now - row["last_collected"] < 86400:
+                return ("cooldown", 86400 - (now - row["last_collected"]))
+            await conn.execute("UPDATE users SET wallet = wallet + $1 WHERE id=$2", amount, user_id)
+            await conn.execute(
+                """INSERT INTO collect_cooldowns (user_id, last_collected) VALUES ($1,$2)
+                   ON CONFLICT (user_id) DO UPDATE SET last_collected = EXCLUDED.last_collected""",
+                user_id, now,
+            )
+            wallet = await conn.fetchval("SELECT wallet FROM users WHERE id=$1", user_id)
+            return ("success", wallet)
+
+        status, value = await run_transaction(self.pool, operation, label="economy.collect")
+        if status == "cooldown":
+            return await ctx.send(embed=cooldown_embed(ctx, value))
+        embed = result_embed(
+            ctx, f"{EMOJIS['gift']} Collect", f"You collected **{amount:,}** Moon Dust!", win=True
+        )
+        embed.add_field(name="Wallet", value=f"`{value:,}` Moon Dust", inline=False)
         await ctx.send(embed=embed)
 
     # ─── ECONOMY COMMANDS ───────────────────────────────────────
@@ -2109,7 +2680,6 @@ class Economy(commands.Cog):
         embed.add_field(name="Bank", value=f"{EMOJIS['bank']} `{bank:,}` Moon Dust", inline=True)
         await ctx.send(embed=embed)
 
-    # ─── ADMIN: INTEREST RATE (silent for non-admins) ───────────
     @commands.command(name="interestrate", aliases=["ir"])
     async def interest_rate(self, ctx: commands.Context):
         """View the bank interest rate. Admin only."""
@@ -2156,12 +2726,12 @@ class Economy(commands.Cog):
                 success = random.random() < 0.50
                 if success:
                     stolen = min(random.randint(200, 600), target_wallet)
-                    victim_new = await self.add_wallet(user.id, -stolen)
-                    if victim_new is None:
+                    # The target is the source; the robber receives the stolen amount.
+                    result = await self._atomic_wallet_transfer(user.id, ctx.author.id, stolen)
+                    if result is None:
                         return await ctx.send(embed=error_embed(
                             ctx, "Robbery Failed", "Insufficient funds on target."))
-                    await self.add_wallet(ctx.author.id, stolen)
-                    robber_wallet = await self.get_wallet(ctx.author.id)
+                    _, robber_wallet = result
                     desc = (f"You robbed {user.mention} and got **{stolen:,}** Moon Dust!\n"
                             f"Your wallet: `{robber_wallet:,}` Moon Dust")
                 else:
@@ -2176,29 +2746,20 @@ class Economy(commands.Cog):
         await self.check_broke(user.id)
 
     @commands.command(name="shop")
+    @commands.guild_only()
     async def shop(self, ctx: commands.Context):
-        """Browse the shop (use the prefix buy command to purchase)."""
-        embed = discord.Embed(title=f"{EMOJIS['shopping_cart']} Frosty Shop", color=EMBED_COLOR)
-        if ctx.guild:
-            embed.set_author(name=ctx.guild.name,
-                             icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
-        embed.description = f"{BREAKER_LINE}\nUse `{PREFIX}buy` to purchase items.\n{BREAKER_LINE}"
-        for name, item in DEFAULT_SHOP_ITEMS.items():
-            emoji = EMOJIS.get(SHOP_EMOJI_MAP.get(name, "package"), EMOJIS["package"])
-            embed.add_field(
-                name=f"{emoji} `{name.replace('_', ' ').title()}` — `{format_coins(item['price'])}`",
-                value=item['description'],
-                inline=True)
-        for name, item in self.custom_shop_items.items():
-            emoji = EMOJIS["package"]
-            desc = item['description'] or f"Custom {item['type'].capitalize()}"
-            embed.add_field(
-                name=f"{emoji} `{name}` — `{format_coins(item['price'])}`",
-                value=desc,
-                inline=True)
-        embed.add_field(name="\u200b", value=BREAKER_LINE, inline=False)
-        embed.set_footer(text=f"Use {PREFIX}buy to purchase items")
-        await ctx.send(embed=embed)
+        """Open the interactive shop — buy, view more, and exit."""
+        view = ShopView(self, ctx)
+        embed = await view._shop_embed()
+        view.set_embed(embed)
+        prepare_v2_view(view, embed)
+        msg = await ctx.send(view=view)
+        view.message = msg
+        try:
+            view.set_embed(embed)
+            await msg.edit(view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @commands.command(name="inv")
     async def inv(self, ctx: commands.Context):
@@ -2220,17 +2781,21 @@ class Economy(commands.Cog):
         embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
         await ctx.send(embed=embed)
 
-    # ─── LEADERBOARD ────────────────────────────────────────────
     @commands.command(name="leaderboard", aliases=["lb", "top"])
     async def leaderboard(self, ctx: commands.Context):
         """View the interactive leaderboard — wallet, bank, net worth, weekly & monthly gains."""
         view = LeaderboardView(self, ctx)
         embed = await view.build_embed()
+        view.set_embed(embed)
         prepare_v2_view(view, embed)
         msg = await ctx.send(view=view)
         view.message = msg
+        try:
+            view.set_embed(embed)
+            await msg.edit(view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
-    # ─── LEADERBOARD QUERIES (users with 0 excluded) ────────────
     async def _get_top_10(self, category: str, ctx):
         if category == "wallet":
             query = "SELECT id, wallet FROM users WHERE wallet > 0 ORDER BY wallet DESC LIMIT 10"
@@ -2275,7 +2840,6 @@ class Economy(commands.Cog):
         rows = await self._fetch(query, start, now)
         return [(row['id'], row['gained']) for row in rows]
 
-    # ─── OWNER/ADMIN COMMANDS ───────────────────────────────────
     @commands.command(name="mgive")
     async def mgive(self, ctx: commands.Context, user: discord.Member, amount: str):
         """Give Moon Dust to a user. Bot owner or admin role only."""
@@ -2325,12 +2889,22 @@ class Economy(commands.Cog):
         msg = await ctx.send(view=confirm_view)
         await confirm_view.wait()
         if confirm_view.value:
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    for tbl in ("users", "inventory", "equipped", "custom_roles", "left_users",
-                                "balance_snapshots", "economy_channel_bypass", "collect_cooldowns",
-                                "command_cooldowns", "user_custom_items", "custom_shop_items"):
-                        await conn.execute(f"DELETE FROM {tbl}")
+            async def clear_operation(conn):
+                # Take per-user locks in a stable order before the destructive reset.
+                user_rows = await conn.fetch("SELECT id FROM users ORDER BY id")
+                user_ids = [row["id"] for row in user_rows]
+                if user_ids:
+                    await self._lock_economy_users(conn, *user_ids)
+                # Tables are fixed constants, never user input.
+                for tbl in (
+                    "inventory", "equipped", "custom_roles", "left_users", "balance_snapshots",
+                    "economy_channel_bypass", "collect_cooldowns", "command_cooldowns", "rob_immunity",
+                    "user_custom_items", "custom_shop_items", "registered_users", "purged_accounts", "users",
+                ):
+                    await conn.execute(f"DELETE FROM {tbl}")
+
+            await run_transaction(self.pool, clear_operation, label="economy.clear_all")
+            await self._load_custom_shop()
             result = discord.Embed(title=f"{EMOJIS['tick']} Economy Reset",
                                    description="All balances, inventories, and equipment have been cleared.",
                                    color=EMBED_COLOR)
@@ -2342,7 +2916,6 @@ class Economy(commands.Cog):
             self_v2 = ComponentsV2View(timeout=30, embed=result)
             await msg.edit(view=self_v2)
 
-    # ─── ADMIN SHOP MANAGEMENT ──────────────────────────────────
     @commands.group(name="economy", invoke_without_command=True)
     async def economy_group(self, ctx: commands.Context):
         """Economy admin commands (owner or admin role only)."""
@@ -2414,7 +2987,6 @@ class Economy(commands.Cog):
                              f"{user.mention} can now use economy commands in {channel.mention}.", win=True)
         await ctx.send(embed=embed)
 
-    # ─── GAME COMMANDS (all prefix, all with 10s cooldown) ─────
     @commands.command(name="coinflip", aliases=["cf"])
     async def coinflip(self, ctx: commands.Context, bet: str):
         if not await self.require_registered(ctx):
@@ -2743,10 +3315,10 @@ class Economy(commands.Cog):
             await join_msg.edit(view=view)
         except discord.HTTPException:
             pass
-        if not view.locked and len(view.players) < 2:
+        if not view.locked:
             for pid in view.players:
                 await self.add_wallet(pid, fee)
-            await ctx.send("Not enough players. Entry fees refunded.")
+            await ctx.send("Game cancelled. Entry fees refunded.")
 
     @commands.command(name="transfer", aliases=["gift"])
     async def transfer(self, ctx: commands.Context, user: discord.Member, amount: str):
@@ -2774,7 +3346,6 @@ class Economy(commands.Cog):
         await ctx.send(embed=embed)
         await self.check_broke(ctx.author.id)
 
-    # ─── HEIST SYSTEM ───────────────────────────────────────────
     @commands.command(name="heist")
     async def heist(self, ctx: commands.Context, target: discord.Member):
         if not await self.require_registered(ctx):
@@ -2802,7 +3373,6 @@ class Economy(commands.Cog):
         prepare_v2_view(view, embed)
         await ctx.send(view=view)
 
-    # ─── BUY COMMAND (prefix-only; dropdown callbacks use interactions) ──
     @commands.command(name="buy")
     @commands.guild_only()
     async def buy(self, ctx: commands.Context, quantity: int = 1):
@@ -2843,9 +3413,8 @@ class Economy(commands.Cog):
             return await ctx.send(embed=error_embed(ctx, "Shop Empty", "No items available."))
 
         view = BuySelectView(self, ctx.author, quantity, options)
-        await ctx.send(content=f"Select an item to buy — quantity: **{quantity}**", view=view)
+        view.message = await ctx.send(content=f"Select an item to buy — quantity: **{quantity}**", view=view)
 
-    # ─── PURCHASE CORE (called by the *buy dropdown) ────────────
     async def _process_purchase_interaction(self, interaction: discord.Interaction,
                                              item_name: str, quantity: int):
         user = interaction.user
@@ -2860,7 +3429,69 @@ class Economy(commands.Cog):
         else:
             return error_embed_interaction(interaction, "Unknown Item", f"Item `{item_name}` not found.")
 
+        if quantity < 1:
+            return error_embed_interaction(interaction, "Invalid Quantity", "Quantity must be at least 1.")
+        if guild is None:
+            return error_embed_interaction(interaction, "Server Only", "Shop purchases must be made inside the server.")
+        if not is_default and quantity != 1:
+            return error_embed_interaction(
+                interaction, "Invalid Quantity", "Custom items can only be bought one at a time."
+            )
+
+        # These catalogue entries are explicitly role perks. A missing role ID must
+        # never silently turn one into an inventory item (or charge the buyer).
+        role_required_items = {
+            "afk_permission", "ghost_ping_viewer", "tic_tac_toe",
+            "rock_paper_scissors", "eight_ball", "mafia_ping", "roulette_ping",
+        }
+        if is_default and item_name in role_required_items and item_name not in self.shop_role_mapping:
+            log.error(
+                "Shop role is not configured | item=%s | guild_id=%s",
+                item_name, guild.id,
+            )
+            return error_embed_interaction(
+                interaction, "Role Not Configured",
+                f"The role for **{item_name.replace('_', ' ').title()}** has not been configured. "
+                "No Moon Dust was deducted. Please contact an administrator."
+            )
+
         async with user_lock(user.id):
+            # Consumables have no Discord API side effects; charge, inventory, and equipment
+            # are committed together in one retryable database transaction.
+            if is_default and item_name not in self.shop_role_mapping and item_name != "custom_role":
+                async def buy_consumable(conn):
+                    await self._lock_economy_users(conn, user.id)
+                    row = await conn.fetchrow("SELECT wallet FROM users WHERE id=$1 FOR UPDATE", user.id)
+                    if row is None or row["wallet"] < price:
+                        return None
+                    await conn.execute(
+                        "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1",
+                        price, user.id,
+                    )
+                    await conn.execute(
+                        """INSERT INTO inventory (user_id, item, qty) VALUES ($1,$2,$3)
+                           ON CONFLICT (user_id, item)
+                           DO UPDATE SET qty = inventory.qty + EXCLUDED.qty""",
+                        user.id, item_name, quantity,
+                    )
+                    await conn.execute(
+                        "INSERT INTO equipped (user_id, item) VALUES ($1,$2) ON CONFLICT (user_id,item) DO NOTHING",
+                        user.id, item_name,
+                    )
+                    return await conn.fetchval("SELECT wallet FROM users WHERE id=$1", user.id)
+
+                wallet_after = await run_transaction(
+                    self.pool, buy_consumable, label="economy.shop_buy_consumable"
+                )
+                if wallet_after is None:
+                    return error_embed_interaction(
+                        interaction, "Insufficient Funds",
+                        f"You need **{format_coins(price)}** Moon Dust in your wallet.")
+                return result_embed_interaction(
+                    interaction, f"{EMOJIS['shopping_cart']} Purchase",
+                    f"You bought **{quantity}× {item_name.replace('_', ' ').title()}** for "
+                    f"**{format_coins(price)}** Moon Dust.\nIt has been equipped automatically.")
+
             wallet = await self.add_wallet(user.id, -price)
             if wallet is None:
                 return error_embed_interaction(
@@ -2868,17 +3499,16 @@ class Economy(commands.Cog):
                     f"You need **{format_coins(price)}** Moon Dust in your wallet.")
 
             if not is_default:
-                if quantity != 1:
-                    await self.add_wallet(user.id, price)
-                    return error_embed_interaction(
-                        interaction, "Invalid Quantity",
-                        "Custom items can only be bought one at a time.")
-                success = await self._grant_custom_item(user.id, item_name)
+                try:
+                    success = await self._grant_custom_item(user.id, item_name)
+                except Exception:
+                    log.exception("Custom shop item grant failed | user_id=%s | item=%s", user.id, item_name)
+                    success = False
                 if not success:
                     await self.add_wallet(user.id, price)
                     return error_embed_interaction(
                         interaction, "Purchase Failed",
-                        "Could not apply the item. Contact an administrator.")
+                        "Could not apply the item. Your payment was refunded.")
                 return result_embed_interaction(
                     interaction, f"{EMOJIS['shopping_cart']} Purchase",
                     f"You bought **{item_name}** for **{format_coins(price)}** Moon Dust.")
@@ -2904,37 +3534,63 @@ class Economy(commands.Cog):
                         interaction, "Permission Error", "I cannot assign that role.")
                 return result_embed_interaction(
                     interaction, f"{EMOJIS['tick']} Purchase Complete",
-                    f"You bought **{item_name.replace('_', ' ').title()}** and received the {role.mention} role.")
+                    f"You bought **{item_name.replace('_', ' ').title()}** and received the {role.name} role.")
 
             if item_name == "custom_role":
                 existing = await self._fetchrow(
-                    "SELECT expiry FROM custom_roles WHERE user_id=$1 AND guild_id=$2",
+                    "SELECT expiry, role_id FROM custom_roles WHERE user_id=$1 AND guild_id=$2",
                     user.id, guild.id)
                 if existing and time.time() < existing['expiry']:
                     await self.add_wallet(user.id, price)
                     days_left = int((existing['expiry'] - time.time()) / 86400)
                     return error_embed_interaction(
                         interaction, "Already Purchased",
-                        f"You already have the Custom Role for another **{days_left}** days.")
-                role = discord.utils.get(guild.roles, name="Custom Role")
-                if not role:
-                    await self.add_wallet(user.id, price)
-                    return error_embed_interaction(
-                        interaction, "Role Not Found",
-                        "The 'Custom Role' does not exist. Contact an administrator.")
+                        f"You already have a custom role for another **{days_left}** days.")
+
+                old_role = guild.get_role(existing['role_id']) if existing else None
+                if old_role and old_role.name.startswith("Custom · "):
+                    try:
+                        if old_role in user.roles:
+                            await user.remove_roles(old_role, reason="Replacing expired custom role")
+                        await old_role.delete(reason="Replacing expired custom role")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                role_name = f"Custom · {user.display_name}"[:100]
                 try:
-                    await user.add_roles(role)
+                    role = await guild.create_role(
+                        name=role_name, color=discord.Color(0x8B5CF6),
+                        reason=f"Shop custom role purchased by {user.id}",
+                    )
+                    await user.add_roles(role, reason="Purchased shop custom role")
                 except discord.Forbidden:
                     await self.add_wallet(user.id, price)
                     return error_embed_interaction(
-                        interaction, "Permission Error", "I cannot assign that role.")
+                        interaction, "Permission Error", "I cannot create or assign your custom role. Check Manage Roles and role hierarchy.")
+                except discord.HTTPException:
+                    await self.add_wallet(user.id, price)
+                    return error_embed_interaction(
+                        interaction, "Purchase Failed", "Discord rejected the custom role creation. Your payment was refunded.")
+
                 expiry = int(time.time()) + 60 * 60 * 24 * 60
-                await self._execute(
-                    "INSERT INTO custom_roles (user_id, guild_id, expiry, role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, guild_id) DO UPDATE SET expiry = EXCLUDED.expiry, role_id = EXCLUDED.role_id",
-                    user.id, guild.id, expiry, role.id)
+                try:
+                    await self._execute(
+                        "INSERT INTO custom_roles (user_id, guild_id, expiry, role_id) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, guild_id) DO UPDATE SET expiry = EXCLUDED.expiry, role_id = EXCLUDED.role_id",
+                        user.id, guild.id, expiry, role.id)
+                except Exception:
+                    logging.getLogger("nuvella.database").exception(
+                        "Failed to save purchased custom role | guild_id=%s | user_id=%s", guild.id, user.id
+                    )
+                    try:
+                        await user.remove_roles(role, reason="Custom role purchase persistence failed")
+                        await role.delete(reason="Custom role purchase persistence failed")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    await self.add_wallet(user.id, price)
+                    return error_embed_interaction(
+                        interaction, "Purchase Failed", "Could not save the role ownership. Your payment was refunded.")
                 return result_embed_interaction(
                     interaction, f"{EMOJIS['owner']} Custom Role Purchased",
-                    f"You bought the **Custom Role** for **{format_coins(price)}** Moon Dust.\nIt will expire in 2 months.")
+                    f"You bought your own **{role.name}** for **{format_coins(price)}** Moon Dust.\nIt will expire in 2 months. Use the `customrole` command to edit it.")
 
             await self.add_item(user.id, item_name, quantity)
             await self._execute(
@@ -2945,7 +3601,6 @@ class Economy(commands.Cog):
                 f"You bought **{quantity}× {item_name.replace('_', ' ').title()}** for "
                 f"**{format_coins(price)}** Moon Dust.\nIt has been equipped automatically.")
 
-    # ─── AMOUNT PARSER (rejects "all" and 0) ────────────────────
     async def _parse_amount(self, ctx, amount_str: str) -> Optional[int]:
         """Parse a bet/amount. Rejects 'all' and any amount <= 0."""
         s = amount_str.lower().replace(",", "").strip()
