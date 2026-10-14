@@ -12,6 +12,7 @@ import logging
 
 from utils.emoji import EMOJIS
 from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
+from utils.database import run_transaction
 # ------------------------- Setup logger -------------------------
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,8 @@ async def log_to_discord(bot, message: str):
                     await channel.send(message[i:i+2000])
             else:
                 await channel.send(message)
-    except Exception as e:
-        print(f"Failed to log to Discord: {e}")
+    except Exception:
+        logger.exception("Failed to send clan log message to Discord")
 
 # ------------------------- Superscript map -------------------------
 SUPERSCRIPT_MAP = {
@@ -174,6 +175,14 @@ class AlreadyClaimed(EconomyError):
 class NoClan(EconomyError):
     pass
 
+
+async def lock_clan_guild(conn, guild_id: int) -> None:
+    """Serialize clan mutations per guild to keep row-lock order consistent."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('nuvella:clan:' || $1::text, 0))",
+        int(guild_id),
+    )
+
 # ------------------------- Audit helper -------------------------
 async def record_economy_transaction(conn, user_id: int, amount: int, transaction_type: str, source: str = None, reference_id: str = None):
     await conn.execute(
@@ -191,49 +200,49 @@ async def eco_get_balance(bot, uid: int) -> int:
         return row or 0
 
 async def eco_add_coins(bot, uid: int, amount: int):
-    """Add coins atomically and log."""
-    async with bot.db_pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", uid)
-            new_wallet = await conn.fetchval(
-                "UPDATE users SET wallet = wallet + $1 WHERE id=$2 RETURNING wallet",
-                amount, uid
-            )
-            await record_economy_transaction(conn, uid, amount, "add", "economy")
-        await log_to_discord(
-            bot,
-            f"{EMOJIS["moon_dust"]} **Balance Change** | User: {uid} | +{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
+    """Add coins atomically and log after the transaction commits."""
+    async def operation(conn):
+        await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", uid)
+        new_wallet = await conn.fetchval(
+            "UPDATE users SET wallet = wallet + $1 WHERE id=$2 RETURNING wallet",
+            amount, uid,
         )
+        await record_economy_transaction(conn, uid, amount, "add", "economy")
+        return new_wallet
+
+    new_wallet = await run_transaction(bot.db_pool, operation, label="clan.eco_add_coins")
+    await log_to_discord(
+        bot,
+        f"{EMOJIS['moon_dust']} **Balance Change** | User: {uid} | +{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}",
+    )
+
 
 async def eco_deduct_coins(bot, uid: int, amount: int) -> bool:
-    """Deduct from wallet atomically if sufficient."""
-    success = False
-    new_wallet = 0
-    async with bot.db_pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", uid)
-            row = await conn.fetchrow(
-                "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
-                amount, uid
-            )
-            if row:
-                new_wallet = row['wallet']
-                await record_economy_transaction(conn, uid, -amount, "deduct", "economy")
-                success = True
-            else:
-                balance = await conn.fetchval("SELECT wallet FROM users WHERE id=$1", uid)
-                new_wallet = balance or 0
-        if success:
-            await log_to_discord(
-                bot,
-                f"{EMOJIS["moon_dust"]} **Balance Change** | User: {uid} | -{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}"
-            )
-        else:
-            await log_to_discord(
-                bot,
-                f"{EMOJIS["moon_dust"]} **Balance Deduction Failed** | User: {uid} | Attempted -{format_coins(amount)} | Wallet: {format_coins(new_wallet)}"
-            )
-        return success
+    """Deduct from wallet atomically if sufficient, and log after commit."""
+    async def operation(conn):
+        await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", uid)
+        row = await conn.fetchrow(
+            "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
+            amount, uid,
+        )
+        if row:
+            await record_economy_transaction(conn, uid, -amount, "deduct", "economy")
+            return True, row["wallet"]
+        balance = await conn.fetchval("SELECT wallet FROM users WHERE id=$1", uid)
+        return False, balance or 0
+
+    success, new_wallet = await run_transaction(bot.db_pool, operation, label="clan.eco_deduct_coins")
+    if success:
+        await log_to_discord(
+            bot,
+            f"{EMOJIS['moon_dust']} **Balance Change** | User: {uid} | -{format_coins(amount)} | New Wallet: {format_coins(new_wallet)}",
+        )
+    else:
+        await log_to_discord(
+            bot,
+            f"{EMOJIS['moon_dust']} **Balance Deduction Failed** | User: {uid} | Attempted -{format_coins(amount)} | Wallet: {format_coins(new_wallet)}",
+        )
+    return success
 
 # ------------------------- Database init -------------------------
 async def init_db(bot):
@@ -703,38 +712,40 @@ class Clans(commands.Cog):
         if len(name) > 30:
             return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Name", "Clan name must be 30 characters or fewer."))
 
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", ctx.author.id)
+            wallet_row = await conn.fetchrow(
+                "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
+                5_000_000, ctx.author.id,
+            )
+            if not wallet_row:
+                raise InsufficientFunds()
+
+            clan_id = await conn.fetchval(
+                "INSERT INTO clans (guild_id, name, owner_id, member_count, total_deposits) "
+                "VALUES ($1, $2, $3, 1, 0) "
+                "ON CONFLICT (guild_id, name) DO NOTHING RETURNING id",
+                ctx.guild.id, name, ctx.author.id,
+            )
+            if not clan_id:
+                raise ClanNameTaken()
+
+            inserted_user = await conn.fetchval(
+                "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
+                "VALUES ($1, $2, $3, 'owner', $4) "
+                "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
+                ctx.author.id, ctx.guild.id, clan_id, ctx.author.nick,
+            )
+            if not inserted_user:
+                raise AlreadyInClan()
+            await record_economy_transaction(
+                conn, ctx.author.id, -5_000_000, "clan_create", "clan", str(clan_id)
+            )
+            return clan_id
+
         try:
-            async with self.bot.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", ctx.author.id)
-                    wallet_row = await conn.fetchrow(
-                        "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
-                        5_000_000, ctx.author.id
-                    )
-                    if not wallet_row:
-                        raise InsufficientFunds()
-
-                    clan_id = await conn.fetchval(
-                        "INSERT INTO clans (guild_id, name, owner_id, member_count, total_deposits) "
-                        "VALUES ($1, $2, $3, 1, 0) "
-                        "ON CONFLICT (guild_id, name) DO NOTHING RETURNING id",
-                        ctx.guild.id, name, ctx.author.id
-                    )
-                    if not clan_id:
-                        raise ClanNameTaken()
-
-                    inserted_user = await conn.fetchval(
-                        "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
-                        "VALUES ($1, $2, $3, 'owner', $4) "
-                        "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
-                        ctx.author.id, ctx.guild.id, clan_id, ctx.author.nick
-                    )
-                    if not inserted_user:
-                        raise AlreadyInClan()
-
-                    await record_economy_transaction(
-                        conn, ctx.author.id, -5_000_000, "clan_create", "clan", str(clan_id)
-                    )
+            await run_transaction(self.bot.db_pool, operation, label="clan.create")
         except InsufficientFunds:
             balance = await eco_get_balance(self.bot, ctx.author.id)
             return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Insufficient Funds",
@@ -772,30 +783,21 @@ class Clans(commands.Cog):
                                    self._do_delete, clan_id)
 
     async def _do_delete(self, ctx, clan_id):
-        # First: perform all database deletions in a single transaction, collecting nick data
-        records = []
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                records = await conn.fetch(
-                    "SELECT user_id, original_nick FROM members WHERE clan_id=$1",
-                    clan_id
-                )
-                await conn.execute("DELETE FROM members WHERE clan_id=$1", clan_id)
-                await conn.execute("DELETE FROM invites WHERE clan_id=$1", clan_id)
-                await conn.execute("DELETE FROM deposits WHERE clan_id=$1", clan_id)
-                await conn.execute("DELETE FROM weekly_claims WHERE clan_id=$1", clan_id)
-                await conn.execute("DELETE FROM clans WHERE id=$1", clan_id)
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            return await self._do_delete_atomic(conn, clan_id)
 
-        # Second: restore Discord nicknames outside DB transaction
-        tasks = []
+        records = await run_transaction(self.bot.db_pool, operation, label="clan.delete")
+        # Restore Discord nicknames outside the retriable database transaction.
+        pending = []
         for record in records:
-            uid = record['user_id']
-            original_nick = record['original_nick']
-            member = ctx.guild.get_member(uid)
+            member = ctx.guild.get_member(record["user_id"])
             if member:
-                tasks.append(asyncio.create_task(member.edit(nick=original_nick)))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                pending.append(member.edit(nick=record["original_nick"], reason="Clan deleted"))
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("A nickname could not be restored after clan deletion: %s", type(result).__name__)
 
         await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Clan Deleted",
                                         "The clan has been deleted.", success=True))
@@ -808,62 +810,77 @@ class Clans(commands.Cog):
         await self._leave(ctx)
 
     async def _leave(self, ctx):
+        # Release the pool connection before waiting for a reaction or acquiring
+        # another connection in _remove_member/_owner_leave. Keeping it open here
+        # can exhaust the shared pool when several users leave at once.
         async with self.bot.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2",
-                ctx.author.id, ctx.guild.id
+                ctx.author.id, ctx.guild.id,
             )
-            if not row:
-                return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", "You aren't in a clan."))
-            clan_id, role = row['clan_id'], row['role']
+        if not row:
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", "You aren't in a clan."))
+        clan_id, role = row["clan_id"], row["role"]
 
-            if role == "owner":
-                await self._confirm_action(ctx,
-                    "You are the owner. Leaving will promote a Co‑Owner if one exists, otherwise the clan will be deleted. Are you sure?",
-                    self._owner_leave, clan_id)
-            else:
-                await self._remove_member(clan_id, ctx.author)
-                await ctx.send(embed=make_embed(ctx, EMOJIS["unlock"], "Left Clan",
-                                                "You left the clan.", success=True))
+        if role == "owner":
+            await self._confirm_action(
+                ctx,
+                "You are the owner. Leaving will promote a Co‑Owner if one exists, otherwise the clan will be deleted. Are you sure?",
+                self._owner_leave, clan_id,
+            )
+        else:
+            await self._remove_member(clan_id, ctx.author)
+            await ctx.send(embed=make_embed(ctx, EMOJIS["unlock"], "Left Clan",
+                                            "You left the clan.", success=True))
 
     async def _owner_leave(self, ctx, clan_id):
-        # Use transaction for ownership transfer or deletion
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                co = await conn.fetchrow(
-                    "SELECT user_id FROM members WHERE clan_id=$1 AND role='coowner' LIMIT 1 FOR UPDATE",
-                    clan_id
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            co = await conn.fetchrow(
+                "SELECT user_id FROM members WHERE clan_id=$1 AND role='coowner' ORDER BY user_id LIMIT 1 FOR UPDATE",
+                clan_id,
+            )
+            if co:
+                original_nick = await conn.fetchval(
+                    "SELECT original_nick FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
+                    clan_id, ctx.author.id,
                 )
-                if co:
-                    new_owner = co['user_id']
-                    await conn.execute("UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, new_owner)
-                    await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", new_owner, clan_id)
-                    await self._remove_member_atomic(conn, clan_id, ctx.author.id)
-                    await ctx.send(embed=make_embed(ctx, EMOJIS["owner"], "Ownership Passed",
-                        f"<@{new_owner}> is now the owner.", success=True))
-                else:
-                    await self._do_delete_atomic(conn, clan_id)
-                    await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Clan Deleted",
-                                                    "The clan has been deleted.", success=True))
+                new_owner = co['user_id']
+                await conn.execute(
+                    "UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2",
+                    clan_id, new_owner,
+                )
+                await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", new_owner, clan_id)
+                await self._remove_member_atomic(conn, clan_id, ctx.author.id)
+                return {"new_owner": new_owner, "records": [{"user_id": ctx.author.id, "original_nick": original_nick}]}
+            records = await self._do_delete_atomic(conn, clan_id)
+            return {"new_owner": None, "records": records}
 
-        # Restore nickname outside DB
-        if co:
-            member = ctx.guild.get_member(ctx.author.id)
-            if member:
-                original_nick = None
-                async with self.bot.db_pool.acquire() as conn:
-                    row = await conn.fetchrow("SELECT original_nick FROM members WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
-                    if row:
-                        original_nick = row['original_nick']
-                if original_nick is not None:
-                    try:
-                        await member.edit(nick=original_nick)
-                    except discord.Forbidden:
-                        pass
+        result = await run_transaction(self.bot.db_pool, operation, label="clan.owner_leave")
+        if result["new_owner"] is not None:
+            await ctx.send(embed=make_embed(
+                ctx, EMOJIS["owner"], "Ownership Passed",
+                f"<@{result['new_owner']}> is now the owner.", success=True,
+            ))
         else:
-            # _do_delete_atomic already deleted all; restore nicks happened in _do_delete_atomic? We'll handle separately
-            # But _owner_leave currently uses _do_delete_atomic which should restore nicks.
-            pass
+            await ctx.send(embed=make_embed(
+                ctx, EMOJIS["delete"], "Clan Deleted", "The clan has been deleted.", success=True,
+            ))
+
+        # Restore nicknames after commit from records captured before deletion.
+        for record in result["records"]:
+            departing_member = ctx.guild.get_member(record["user_id"])
+            original_nick = record.get("original_nick")
+            if departing_member and original_nick is not None:
+                try:
+                    await departing_member.edit(nick=original_nick, reason="Left clan")
+                except discord.Forbidden:
+                    pass
+                except discord.HTTPException:
+                    logger.exception(
+                        "Nickname restore failed after owner leave | guild_id=%s | user_id=%s",
+                        ctx.guild.id, departing_member.id,
+                    )
 
     async def _do_delete_atomic(self, conn, clan_id):
         records = await conn.fetch("SELECT user_id, original_nick FROM members WHERE clan_id=$1", clan_id)
@@ -876,24 +893,41 @@ class Clans(commands.Cog):
         return records
 
     async def _remove_member_atomic(self, conn, clan_id, user_id):
-        await conn.execute("DELETE FROM members WHERE clan_id=$1 AND user_id=$2", clan_id, user_id)
-        await conn.execute("UPDATE clans SET member_count = member_count - 1 WHERE id=$1 AND member_count > 0", clan_id)
+        removed_user_id = await conn.fetchval(
+            "DELETE FROM members WHERE clan_id=$1 AND user_id=$2 RETURNING user_id",
+            clan_id, user_id,
+        )
+        if removed_user_id is not None:
+            await conn.execute(
+                "UPDATE clans SET member_count = GREATEST(member_count - 1, 0) WHERE id=$1",
+                clan_id,
+            )
+            return True
+        return False
 
     async def _remove_member(self, clan_id, member: discord.Member):
-        original_nick = None
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT original_nick FROM members WHERE clan_id=$1 AND user_id=$2",
-                    clan_id, member.id
-                )
-                original_nick = row['original_nick'] if row else None
-                await self._remove_member_atomic(conn, clan_id, member.id)
+        async def operation(conn):
+            await lock_clan_guild(conn, member.guild.id)
+            row = await conn.fetchrow(
+                "SELECT original_nick FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
+                clan_id, member.id,
+            )
+            if not row:
+                return None
+            removed = await self._remove_member_atomic(conn, clan_id, member.id)
+            return row["original_nick"] if removed else None
+
+        original_nick = await run_transaction(
+            self.bot.db_pool, operation, label="clan.remove_member")
         if original_nick is not None:
             try:
-                await member.edit(nick=original_nick)
+                await member.edit(nick=original_nick, reason="Left clan")
             except discord.Forbidden:
-                pass
+                logger.warning("Could not restore nickname after member leave | guild_id=%s | user_id=%s",
+                               member.guild.id, member.id)
+            except discord.HTTPException:
+                logger.exception("Nickname restore failed after member leave | guild_id=%s | user_id=%s",
+                                 member.guild.id, member.id)
 
     # ======================== INVITE ========================
     @clan_group.command(name="invite")
@@ -947,50 +981,49 @@ class Clans(commands.Cog):
         await self._join_by_name(ctx, clan_name, require_invite=False)
 
     async def _join_by_name(self, ctx, clan_name: str, require_invite: bool):
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            row = await conn.fetchrow(
+                "SELECT id, visibility FROM clans WHERE guild_id=$1 AND LOWER(name)=LOWER($2) FOR UPDATE",
+                ctx.guild.id, clan_name,
+            )
+            if not row:
+                raise NoClan(f"No clan `{clan_name}`.")
+            clan_id, visibility = row["id"], row["visibility"]
+
+            if require_invite:
+                invite = await conn.fetchval(
+                    "SELECT 1 FROM invites WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
+                    clan_id, ctx.author.id,
+                )
+                if not invite:
+                    raise NotInvited(f"You haven't been invited to **{clan_name}**.")
+                await conn.execute(
+                    "DELETE FROM invites WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
+            elif visibility != "public":
+                raise PrivateClan("This clan is private – you need an invitation.")
+
+            updated = await conn.fetchval(
+                "UPDATE clans SET member_count=member_count+1 "
+                "WHERE id=$1 AND member_count<20 RETURNING member_count", clan_id)
+            if updated is None:
+                raise ClanFull("This clan is full.")
+
+            inserted = await conn.fetchval(
+                "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
+                "VALUES ($1, $2, $3, 'member', $4) "
+                "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
+                ctx.author.id, ctx.guild.id, clan_id, ctx.author.nick,
+            )
+            if inserted is None:
+                raise AlreadyInClan("You're already in a clan.")
+            return await conn.fetchval("SELECT name FROM clans WHERE id=$1", clan_id)
+
         try:
-            async with self.bot.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    row = await conn.fetchrow(
-                        "SELECT id, visibility FROM clans WHERE guild_id=$1 AND LOWER(name)=LOWER($2) FOR UPDATE",
-                        ctx.guild.id, clan_name
-                    )
-                    if not row:
-                        raise NoClan(f"No clan `{clan_name}`.")
-                    clan_id, vis = row['id'], row['visibility']
-
-                    if require_invite:
-                        inv = await conn.fetchval(
-                            "SELECT 1 FROM invites WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
-                            clan_id, ctx.author.id
-                        )
-                        if not inv:
-                            raise NotInvited(f"You haven't been invited to **{clan_name}**.")
-                        await conn.execute("DELETE FROM invites WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
-                    else:
-                        if vis != "public":
-                            raise PrivateClan("This clan is private – you need an invitation.")
-
-                    # Add member with capacity check and uniqueness
-                    updated = await conn.fetchval(
-                        "UPDATE clans SET member_count = member_count + 1 WHERE id=$1 AND member_count < 20 RETURNING member_count",
-                        clan_id
-                    )
-                    if updated is None:
-                        raise ClanFull("This clan is full.")
-
-                    inserted = await conn.fetchval(
-                        "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
-                        "VALUES ($1, $2, $3, 'member', $4) "
-                        "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
-                        ctx.author.id, ctx.guild.id, clan_id, ctx.author.nick
-                    )
-                    if inserted is None:
-                        raise AlreadyInClan("You're already in a clan.")
-
-                    clan_name_fetched = await conn.fetchval("SELECT name FROM clans WHERE id=$1", clan_id)
-
-        except (NoClan, NotInvited, PrivateClan, ClanFull, AlreadyInClan) as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Error", str(e)))
+            clan_name_fetched = await run_transaction(
+                self.bot.db_pool, operation, label="clan.join")
+        except (NoClan, NotInvited, PrivateClan, ClanFull, AlreadyInClan) as exc:
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Error", str(exc)))
 
         await self._set_nick(ctx.author, clan_name_fetched)
         await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Welcome!",
@@ -1187,40 +1220,45 @@ class Clans(commands.Cog):
         role = role.lower().replace("-", "")
         if role not in ("elder", "coowner"):
             return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Role", "Use `elder` or `coowner`."))
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
-                    ctx.author.id, ctx.guild.id
-                )
-                if not row or row['role'] != 'owner':
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
-                                                           "Only the clan owner can promote."))
-                clan_id = row['clan_id']
-                target = await conn.fetchrow(
-                    "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
-                    clan_id, member.id
-                )
-                if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
-                                                           f"{member.mention} is not in your clan."))
-                if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Promote", "They are the owner."))
-                if target['role'] == role:
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "Already", "They already hold that role."))
 
-                if role == "coowner":
-                    count = await conn.fetchval("SELECT COUNT(*) FROM members WHERE clan_id=$1 AND role='coowner'", clan_id)
-                    if count >= MAX_COOWNERS:
-                        return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Limit Reached",
-                                                               f"Maximum {MAX_COOWNERS} co‑owners allowed."))
-                elif role == "elder":
-                    count = await conn.fetchval("SELECT COUNT(*) FROM members WHERE clan_id=$1 AND role='elder'", clan_id)
-                    if count >= MAX_ELDERS:
-                        return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Limit Reached",
-                                                               f"Maximum {MAX_ELDERS} elders allowed."))
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            owner = await conn.fetchrow(
+                "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
+                ctx.author.id, ctx.guild.id,
+            )
+            if not owner or owner["role"] != "owner":
+                return "not_owner"
+            clan_id = owner["clan_id"]
+            target = await conn.fetchrow(
+                "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE", clan_id, member.id)
+            if not target:
+                return "not_member"
+            if target["role"] == "owner":
+                return "target_owner"
+            if target["role"] == role:
+                return "already"
+            limit = MAX_COOWNERS if role == "coowner" else MAX_ELDERS
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM members WHERE clan_id=$1 AND role=$2", clan_id, role)
+            if count >= limit:
+                return "limit"
+            await conn.execute(
+                "UPDATE members SET role=$1 WHERE clan_id=$2 AND user_id=$3", role, clan_id, member.id)
+            return "ok"
 
-                await conn.execute("UPDATE members SET role=$1 WHERE clan_id=$2 AND user_id=$3", role, clan_id, member.id)
+        result = await run_transaction(self.bot.db_pool, operation, label="clan.promote")
+        errors = {
+            "not_owner": ("Not Owner", "Only the clan owner can promote."),
+            "not_member": ("Not in Clan", f"{member.mention} is not in your clan."),
+            "target_owner": ("Cannot Promote", "They are the owner."),
+            "already": ("Already", "They already hold that role."),
+            "limit": ("Limit Reached", f"Maximum {MAX_COOWNERS if role == 'coowner' else MAX_ELDERS} {('co-owners' if role == 'coowner' else 'elders')} allowed."),
+        }
+        if result != "ok":
+            title, message = errors[result]
+            emoji = EMOJIS["warning"] if result == "already" else EMOJIS["cross"]
+            return await ctx.send(embed=make_embed(ctx, emoji, title, message))
         await ctx.send(embed=make_embed(ctx, EMOJIS["chart"], "Promoted",
                                         f"{member.mention} is now **{role}**.", success=True))
 
@@ -1233,30 +1271,37 @@ class Clans(commands.Cog):
         await self._demote(ctx, member)
 
     async def _demote(self, ctx, member: discord.Member):
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
-                    ctx.author.id, ctx.guild.id
-                )
-                if not row or row['role'] != 'owner':
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
-                                                           "Only the owner can demote."))
-                clan_id = row['clan_id']
-                target = await conn.fetchrow(
-                    "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
-                    clan_id, member.id
-                )
-                if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
-                                                           f"{member.mention} is not in your clan."))
-                if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Demote", "They are the owner."))
-                if target['role'] == "member":
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["warning"], "Already",
-                                                           "They are already a regular member."))
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            owner = await conn.fetchrow(
+                "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
+                ctx.author.id, ctx.guild.id)
+            if not owner or owner["role"] != "owner":
+                return "not_owner"
+            clan_id = owner["clan_id"]
+            target = await conn.fetchrow(
+                "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE", clan_id, member.id)
+            if not target:
+                return "not_member"
+            if target["role"] == "owner":
+                return "target_owner"
+            if target["role"] == "member":
+                return "already"
+            await conn.execute(
+                "UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
+            return "ok"
 
-                await conn.execute("UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
+        result = await run_transaction(self.bot.db_pool, operation, label="clan.demote")
+        errors = {
+            "not_owner": ("Not Owner", "Only the clan owner can demote."),
+            "not_member": ("Not in Clan", f"{member.mention} is not in your clan."),
+            "target_owner": ("Cannot Demote", "They are the owner."),
+            "already": ("Already", "They are already a regular member."),
+        }
+        if result != "ok":
+            title, message = errors[result]
+            emoji = EMOJIS["warning"] if result == "already" else EMOJIS["cross"]
+            return await ctx.send(embed=make_embed(ctx, emoji, title, message))
         await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Demoted",
                                         f"{member.mention} is now a member.", success=True))
 
@@ -1283,11 +1328,37 @@ class Clans(commands.Cog):
             self._do_transfer, clan_id, member)
 
     async def _do_transfer(self, ctx, clan_id, member: discord.Member):
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
-                await conn.execute("UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
-                await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", member.id, clan_id)
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            owner = await conn.fetchrow(
+                "SELECT role FROM members WHERE clan_id=$1 AND guild_id=$2 AND user_id=$3 FOR UPDATE",
+                clan_id, ctx.guild.id, ctx.author.id)
+            target = await conn.fetchrow(
+                "SELECT role FROM members WHERE clan_id=$1 AND guild_id=$2 AND user_id=$3 FOR UPDATE",
+                clan_id, ctx.guild.id, member.id)
+            if not owner or owner["role"] != "owner":
+                return "not_owner"
+            if not target:
+                return "not_member"
+            if member.id == ctx.author.id:
+                return "self"
+            await conn.execute(
+                "UPDATE members SET role='member' WHERE clan_id=$1 AND user_id=$2", clan_id, ctx.author.id)
+            await conn.execute(
+                "UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, member.id)
+            await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", member.id, clan_id)
+            return "ok"
+
+        result = await run_transaction(self.bot.db_pool, operation, label="clan.transfer_owner")
+        if result == "not_owner":
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner",
+                                                   "You no longer own this clan."))
+        if result == "not_member":
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
+                                                   "The selected member is no longer in your clan."))
+        if result == "self":
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Transfer",
+                                                   "You already own the clan."))
         await ctx.send(embed=make_embed(ctx, EMOJIS["owner"], "Ownership Transferred",
                                         f"{member.mention} is now the owner.", success=True))
 
@@ -1300,27 +1371,55 @@ class Clans(commands.Cog):
         await self._kick(ctx, member)
 
     async def _kick(self, ctx, member: discord.Member):
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT clan_id FROM members WHERE user_id=$1 AND guild_id=$2 AND role='owner' FOR UPDATE",
-                    ctx.author.id, ctx.guild.id
-                )
-                if not row:
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not Owner", "You don't own a clan."))
-                clan_id = row['clan_id']
-                target = await conn.fetchrow(
-                    "SELECT role FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE", clan_id, member.id
-                )
-                if not target:
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Not in Clan",
-                                                           "That member is not in your clan."))
-                if target['role'] == "owner":
-                    return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Cannot Kick",
-                                                           "You can't kick yourself."))
-                await self._remove_member_atomic(conn, clan_id, member.id)
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            row = await conn.fetchrow(
+                "SELECT clan_id FROM members WHERE user_id=$1 AND guild_id=$2 AND role='owner' FOR UPDATE",
+                ctx.author.id, ctx.guild.id,
+            )
+            if not row:
+                return {"error": "not_owner"}
+            clan_id = row["clan_id"]
+            target = await conn.fetchrow(
+                "SELECT role, original_nick FROM members WHERE clan_id=$1 AND user_id=$2 FOR UPDATE",
+                clan_id, member.id,
+            )
+            if not target:
+                return {"error": "not_member"}
+            if target["role"] == "owner":
+                return {"error": "cannot_kick_owner"}
+            removed = await self._remove_member_atomic(conn, clan_id, member.id)
+            if not removed:
+                return {"error": "not_member"}
+            return {"original_nick": target["original_nick"]}
 
-        await self._remove_member(clan_id, member)
+        outcome = await run_transaction(
+            self.bot.db_pool, operation, label="clan.kick_member")
+        errors = {
+            "not_owner": ("Not Owner", "You don't own a clan."),
+            "not_member": ("Not in Clan", "That member is not in your clan."),
+            "cannot_kick_owner": ("Cannot Kick", "You can't kick yourself."),
+        }
+        if outcome.get("error"):
+            title, message = errors[outcome["error"]]
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], title, message))
+
+        # _remove_member_atomic already removed the membership and updated the
+        # count. Do not call _remove_member a second time (it decremented twice).
+        original_nick = outcome.get("original_nick")
+        if original_nick is not None:
+            try:
+                await member.edit(nick=original_nick, reason="Removed from clan")
+            except discord.Forbidden:
+                logger.warning(
+                    "Could not restore nickname after clan kick | guild_id=%s | user_id=%s",
+                    ctx.guild.id, member.id,
+                )
+            except discord.HTTPException:
+                logger.exception(
+                    "Nickname restore failed after clan kick | guild_id=%s | user_id=%s",
+                    ctx.guild.id, member.id,
+                )
         await ctx.send(embed=make_embed(ctx, EMOJIS["delete"], "Kicked",
                                         f"{member.mention} has been kicked from the clan.", success=True))
 
@@ -1495,52 +1594,44 @@ class Clans(commands.Cog):
         if amount <= 0:
             return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Invalid Amount", "Must be positive."))
 
-        final_level = None
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            row = await conn.fetchrow(
+                "SELECT clan_id FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
+                ctx.author.id, ctx.guild.id)
+            if not row:
+                raise NoClan("You aren't in a clan.")
+            clan_id = row["clan_id"]
+            await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", ctx.author.id)
+            wallet_row = await conn.fetchrow(
+                "UPDATE users SET wallet=wallet-$1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
+                amount, ctx.author.id)
+            if not wallet_row:
+                raise InsufficientFunds("Insufficient funds")
+            await conn.execute(
+                "INSERT INTO deposits (user_id, guild_id, clan_id, amount) VALUES ($1, $2, $3, $4)",
+                ctx.author.id, ctx.guild.id, clan_id, amount)
+            total = await conn.fetchval(
+                "UPDATE clans SET total_deposits=total_deposits+$1 WHERE id=$2 RETURNING total_deposits",
+                amount, clan_id)
+            new_level = self.get_level_from_deposits(total)
+            await conn.execute("UPDATE clans SET level=GREATEST(level, $1) WHERE id=$2", new_level, clan_id)
+            await record_economy_transaction(
+                conn, ctx.author.id, -amount, "clan_deposit", "deposit", str(clan_id))
+            return await conn.fetchval("SELECT level FROM clans WHERE id=$1", clan_id)
+
         try:
-            async with self.bot.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    row = await conn.fetchrow(
-                        "SELECT clan_id FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
-                        ctx.author.id, ctx.guild.id
-                    )
-                    if not row:
-                        raise NoClan("You aren't in a clan.")
-                    clan_id = row['clan_id']
-
-                    await conn.execute("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", ctx.author.id)
-                    wallet_row = await conn.fetchrow(
-                        "UPDATE users SET wallet = wallet - $1 WHERE id=$2 AND wallet >= $1 RETURNING wallet",
-                        amount, ctx.author.id
-                    )
-                    if not wallet_row:
-                        raise InsufficientFunds("Insufficient funds")
-
-                    await conn.execute(
-                        "INSERT INTO deposits (user_id, guild_id, clan_id, amount) VALUES ($1, $2, $3, $4)",
-                        ctx.author.id, ctx.guild.id, clan_id, amount
-                    )
-                    total = await conn.fetchval(
-                        "UPDATE clans SET total_deposits = total_deposits + $1 WHERE id=$2 RETURNING total_deposits",
-                        amount, clan_id
-                    )
-                    new_level = self.get_level_from_deposits(total)
-                    await conn.execute(
-                        "UPDATE clans SET level = GREATEST(level, $1) WHERE id=$2",
-                        new_level, clan_id
-                    )
-                    await record_economy_transaction(conn, ctx.author.id, -amount, "clan_deposit", "deposit", str(clan_id))
-                    final_level = await conn.fetchval("SELECT level FROM clans WHERE id=$1", clan_id)
-        except NoClan as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(e)))
+            final_level = await run_transaction(self.bot.db_pool, operation, label="clan.deposit")
+        except NoClan as exc:
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(exc)))
         except InsufficientFunds:
             balance = await eco_get_balance(self.bot, ctx.author.id)
             return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "Insufficient Funds",
-                                                   f"You don't have {EMOJIS["moon_dust"]} **{format_coins(amount)}** coins. You have {format_coins(balance)}."))
+                                                   f"You don't have {EMOJIS['moon_dust']} **{format_coins(amount)}** coins. You have {format_coins(balance)}."))
 
         await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Deposit Successful",
-                                        f"Deposited {EMOJIS["moon_dust"]} **{format_coins(amount)}** into your clan bank.\n"
-                                        f"Current clan level: **{final_level}**",
-                                        success=True))
+                                        f"Deposited {EMOJIS['moon_dust']} **{format_coins(amount)}** into your clan bank.\n"
+                                        f"Current clan level: **{final_level}**", success=True))
 
     # ======================== BANK ========================
     @clan_group.command(name="bank")
@@ -1587,44 +1678,43 @@ class Clans(commands.Cog):
         await self._weekly(ctx)
 
     async def _weekly(self, ctx):
-        reward = 0
-        level = 0
+        async def operation(conn):
+            await lock_clan_guild(conn, ctx.guild.id)
+            row = await conn.fetchrow(
+                "SELECT m.clan_id, m.role, c.level FROM members m JOIN clans c ON m.clan_id=c.id "
+                "WHERE m.user_id=$1 AND m.guild_id=$2 FOR UPDATE",
+                ctx.author.id, ctx.guild.id)
+            if not row:
+                raise NoClan("You aren't in a clan.")
+            clan_id, role, level = row["clan_id"], row["role"], row["level"]
+            claim_time = await conn.fetchval(
+                """INSERT INTO weekly_claims (user_id, guild_id, clan_id, claim_time)
+                   VALUES ($1, $2, $3, NOW())
+                   ON CONFLICT (user_id, guild_id, clan_id)
+                   DO UPDATE SET claim_time=EXCLUDED.claim_time
+                   WHERE weekly_claims.claim_time < NOW() - INTERVAL '7 days'
+                   RETURNING claim_time""",
+                ctx.author.id, ctx.guild.id, clan_id)
+            if claim_time is None:
+                raise AlreadyClaimed("You already claimed this week.")
+            reward = level * 10000 + WEEKLY_ROLE_BONUS.get(role, 0)
+            await conn.execute(
+                "INSERT INTO users (id, wallet, bank) VALUES ($1, 0, 0) ON CONFLICT (id) DO NOTHING",
+                ctx.author.id)
+            await conn.execute("UPDATE users SET wallet=wallet+$1 WHERE id=$2", reward, ctx.author.id)
+            await record_economy_transaction(
+                conn, ctx.author.id, reward, "weekly_reward", "weekly", str(clan_id))
+            return reward, level
+
         try:
-            async with self.bot.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    row = await conn.fetchrow(
-                        "SELECT m.clan_id, m.role, c.level FROM members m JOIN clans c ON m.clan_id=c.id "
-                        "WHERE m.user_id=$1 AND m.guild_id=$2 FOR UPDATE",
-                        ctx.author.id, ctx.guild.id
-                    )
-                    if not row:
-                        raise NoClan("You aren't in a clan.")
-                    clan_id, role, level = row['clan_id'], row['role'], row['level']
-
-                    claim_time = await conn.fetchval(
-                        """
-                        INSERT INTO weekly_claims (user_id, guild_id, clan_id, claim_time)
-                        VALUES ($1, $2, $3, NOW())
-                        ON CONFLICT (user_id, guild_id, clan_id)
-                        DO UPDATE SET claim_time = EXCLUDED.claim_time
-                        WHERE weekly_claims.claim_time < NOW() - INTERVAL '7 days'
-                        RETURNING claim_time
-                        """,
-                        ctx.author.id, ctx.guild.id, clan_id
-                    )
-                    if claim_time is None:
-                        raise AlreadyClaimed("You already claimed this week.")
-
-                    reward = level * 10000 + WEEKLY_ROLE_BONUS.get(role, 0)
-                    await conn.execute("UPDATE users SET wallet = wallet + $1 WHERE id=$2", reward, ctx.author.id)
-                    await record_economy_transaction(conn, ctx.author.id, reward, "weekly_reward", "weekly", str(clan_id))
-        except NoClan as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(e)))
-        except AlreadyClaimed as e:
-            return await ctx.send(embed=make_embed(ctx, EMOJIS["mute"], "Already Claimed", str(e)))
+            reward, level = await run_transaction(self.bot.db_pool, operation, label="clan.weekly")
+        except NoClan as exc:
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["cross"], "No Clan", str(exc)))
+        except AlreadyClaimed as exc:
+            return await ctx.send(embed=make_embed(ctx, EMOJIS["mute"], "Already Claimed", str(exc)))
 
         await ctx.send(embed=make_embed(ctx, EMOJIS["tick"], "Weekly Bonus",
-                                        f"You received {EMOJIS["moon_dust"]} **{format_coins(reward)}** from your clan! (Level {level})",
+                                        f"You received {EMOJIS['moon_dust']} **{format_coins(reward)}** from your clan! (Level {level})",
                                         success=True))
 
     # ======================== TOP ========================
@@ -1973,30 +2063,32 @@ class Clans(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member):
-        async with self.bot.db_pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
-                    member.id, member.guild.id
-                )
-                if not row:
-                    return
-                clan_id, role = row['clan_id'], row['role']
-                if role == "owner":
-                    co = await conn.fetchrow(
-                        "SELECT user_id FROM members WHERE clan_id=$1 AND role='coowner' LIMIT 1 FOR UPDATE",
-                        clan_id
-                    )
-                    if co:
-                        await conn.execute("UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2", clan_id, co['user_id'])
-                        await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", co['user_id'], clan_id)
-                        await self._remove_member_atomic(conn, clan_id, member.id)
-                    else:
-                        # Delete clan and all members
-                        records = await self._do_delete_atomic(conn, clan_id)
-                        # Cannot restore nicks here; Discord member already left, no need
-                else:
+        async def operation(conn):
+            await lock_clan_guild(conn, member.guild.id)
+            row = await conn.fetchrow(
+                "SELECT clan_id, role FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
+                member.id, member.guild.id)
+            if not row:
+                return False
+            clan_id, role = row["clan_id"], row["role"]
+            if role == "owner":
+                co = await conn.fetchrow(
+                    "SELECT user_id FROM members WHERE clan_id=$1 AND role='coowner' "
+                    "ORDER BY user_id LIMIT 1 FOR UPDATE", clan_id)
+                if co:
+                    await conn.execute(
+                        "UPDATE members SET role='owner' WHERE clan_id=$1 AND user_id=$2",
+                        clan_id, co["user_id"])
+                    await conn.execute("UPDATE clans SET owner_id=$1 WHERE id=$2", co["user_id"], clan_id)
                     await self._remove_member_atomic(conn, clan_id, member.id)
+                else:
+                    await self._do_delete_atomic(conn, clan_id)
+            else:
+                await self._remove_member_atomic(conn, clan_id, member.id)
+            return True
+
+        await run_transaction(self.bot.db_pool, operation, label="clan.member_remove")
+
 
 
 class BadgeDropdown(discord.ui.Select):
@@ -2086,56 +2178,58 @@ class InviteAcceptView(ComponentsV2View):
         if interaction.user.id != self.invitee.id:
             return await interaction.response.send_message("This invitation is not for you.", ephemeral=True)
 
+        async def operation(conn):
+            await lock_clan_guild(conn, self.ctx.guild.id)
+            existing = await conn.fetchval(
+                "SELECT 1 FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
+                self.invitee.id, self.ctx.guild.id)
+            if existing:
+                raise AlreadyInClan("You're already in a clan.")
+            row = await conn.fetchrow("SELECT name FROM clans WHERE id=$1 FOR UPDATE", self.clan_id)
+            if not row:
+                raise NoClan("Clan no longer exists.")
+            clan_name = row["name"]
+            updated = await conn.fetchval(
+                "UPDATE clans SET member_count=member_count+1 WHERE id=$1 AND member_count<20 RETURNING member_count",
+                self.clan_id)
+            if updated is None:
+                raise ClanFull("This clan is full.")
+            inserted = await conn.fetchval(
+                "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
+                "VALUES ($1, $2, $3, 'member', $4) "
+                "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
+                self.invitee.id, self.ctx.guild.id, self.clan_id, self.invitee.nick)
+            if inserted is None:
+                raise AlreadyInClan("You're already in a clan.")
+            return clan_name
+
         try:
-            async with self.bot.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    # Check if already in clan
-                    existing = await conn.fetchval(
-                        "SELECT 1 FROM members WHERE user_id=$1 AND guild_id=$2 FOR UPDATE",
-                        self.invitee.id, self.ctx.guild.id
-                    )
-                    if existing:
-                        raise AlreadyInClan("You're already in a clan.")
-
-                    row = await conn.fetchrow("SELECT name FROM clans WHERE id=$1 FOR UPDATE", self.clan_id)
-                    if not row:
-                        raise NoClan("Clan no longer exists.")
-                    clan_name = row['name']
-
-                    # Capacity check and atomic increment
-                    updated = await conn.fetchval(
-                        "UPDATE clans SET member_count = member_count + 1 WHERE id=$1 AND member_count < 20 RETURNING member_count",
-                        self.clan_id
-                    )
-                    if updated is None:
-                        raise ClanFull("This clan is full.")
-
-                    inserted = await conn.fetchval(
-                        "INSERT INTO members (user_id, guild_id, clan_id, role, original_nick) "
-                        "VALUES ($1, $2, $3, 'member', $4) "
-                        "ON CONFLICT (user_id, guild_id) DO NOTHING RETURNING user_id",
-                        self.invitee.id, self.ctx.guild.id, self.clan_id, self.invitee.nick
-                    )
-                    if inserted is None:
-                        raise AlreadyInClan("You're already in a clan.")
-        except (AlreadyInClan, NoClan, ClanFull) as e:
-            return await interaction.response.send_message(str(e), ephemeral=True)
+            clan_name = await run_transaction(self.bot.db_pool, operation, label="clan.invite_accept")
+        except (AlreadyInClan, NoClan, ClanFull) as exc:
+            return await interaction.response.send_message(str(exc), ephemeral=True)
 
         suffix = to_superscript(clan_name)
         base = self.invitee.nick if self.invitee.nick else self.invitee.name
         new_nick = f"{base}{suffix}"
         if len(new_nick) > 32:
-            max_base = 32 - len(suffix)
-            base = base[:max_base]
+            base = base[:32 - len(suffix)]
             new_nick = f"{base}{suffix}"
         try:
             await self.invitee.edit(nick=new_nick)
         except discord.Forbidden:
-            pass
+            logger.warning("Could not apply clan nickname after invite accept | guild_id=%s | user_id=%s",
+                           self.ctx.guild.id, self.invitee.id)
+        except discord.HTTPException:
+            logger.exception("Could not apply clan nickname after invite accept | guild_id=%s | user_id=%s",
+                             self.ctx.guild.id, self.invitee.id)
 
         await interaction.response.send_message(f"{EMOJIS['tick']} You've joined **{clan_name}**!", ephemeral=True)
         disable_all_components(self)
-        await interaction.message.edit(view=self)
+        try:
+            await interaction.message.edit(view=self)
+        except (discord.NotFound, discord.HTTPException):
+            logger.warning("Could not disable accepted clan invite view | guild_id=%s | user_id=%s",
+                           self.ctx.guild.id, self.invitee.id)
 
     async def decline(self, interaction: discord.Interaction):
         if interaction.user.id != self.invitee.id:
