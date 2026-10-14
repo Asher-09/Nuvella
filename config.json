@@ -4,7 +4,7 @@
   "allowed_channel_id": 1555408897013977150,
   "log_channel_id": 1537456851921281115,
   "roles": {
-    "admin_role_id": 1535961372951576596,
+    "admin_role_id": 1558406451150716978,
     "senior_moderator_role_id": 1535961383336812685,
     "moderator_role_id": 1535961394120364122,
     "trial_moderator_role_id": 1535961404509524039,
@@ -31,26 +31,86 @@
   },
   "economy": {
     "collect_roles": {
-      "admin": { "role_id": 1535961372951576596, "amount": 16000 },
-      "senior_moderator": { "role_id": 1535961383336812685, "amount": 15000 },
-      "moderator": { "role_id": 1535961394120364122, "amount": 14000 },
-      "trial_moderator": { "role_id": 1535961404509524039, "amount": 12000 },
-      "developer": { "role_id": 1535966374134939669, "amount": 13000 },
-      "event_manager": { "role_id": 1535961479550083234, "amount": 14000 },
-      "event_trial": { "role_id": 1535996114753560606, "amount": 12000 },
-      "level_100": { "role_id": 1535961760023052329, "amount": 12000 },
-      "level_90": { "role_id": 1535961738904870962, "amount": 10000 },
-      "level_80": { "role_id": 1535961717274714132, "amount": 8000 },
-      "level_70": { "role_id": 1535961695988748298, "amount": 6000 },
-      "level_60": { "role_id": 1535961673016287306, "amount": 4000 },
-      "level_50": { "role_id": 1535961651734519909, "amount": 2000 },
-      "level_40": { "role_id": 1535961629093531718, "amount": 1000 },
-      "level_30": { "role_id": 1535961607845322813, "amount": 800 },
-      "level_20": { "role_id": 1535961586399977512, "amount": 600 },
-      "level_10": { "role_id": 1535961565319266394, "amount": 400 },
-      "level_1": { "role_id": 1535961544725368872, "amount": 200 },
-      "supporter": { "role_id": 1536182809830625292, "amount": 5000 },
-      "contributor": { "role_id": 1535961511275536477, "amount": 10000 }
+      "admin": {
+        "role_id": 1558406451150716978,
+        "amount": 16000
+      },
+      "senior_moderator": {
+        "role_id": 1535961383336812685,
+        "amount": 15000
+      },
+      "moderator": {
+        "role_id": 1535961394120364122,
+        "amount": 14000
+      },
+      "trial_moderator": {
+        "role_id": 1535961404509524039,
+        "amount": 12000
+      },
+      "developer": {
+        "role_id": 1535966374134939669,
+        "amount": 13000
+      },
+      "event_manager": {
+        "role_id": 1535961479550083234,
+        "amount": 14000
+      },
+      "event_trial": {
+        "role_id": 1535996114753560606,
+        "amount": 12000
+      },
+      "level_100": {
+        "role_id": 1535961760023052329,
+        "amount": 12000
+      },
+      "level_90": {
+        "role_id": 1535961738904870962,
+        "amount": 10000
+      },
+      "level_80": {
+        "role_id": 1535961717274714132,
+        "amount": 8000
+      },
+      "level_70": {
+        "role_id": 1535961695988748298,
+        "amount": 6000
+      },
+      "level_60": {
+        "role_id": 1535961673016287306,
+        "amount": 4000
+      },
+      "level_50": {
+        "role_id": 1535961651734519909,
+        "amount": 2000
+      },
+      "level_40": {
+        "role_id": 1535961629093531718,
+        "amount": 1000
+      },
+      "level_30": {
+        "role_id": 1535961607845322813,
+        "amount": 800
+      },
+      "level_20": {
+        "role_id": 1535961586399977512,
+        "amount": 600
+      },
+      "level_10": {
+        "role_id": 1535961565319266394,
+        "amount": 400
+      },
+      "level_1": {
+        "role_id": 1535961544725368872,
+        "amount": 200
+      },
+      "supporter": {
+        "role_id": 1536182809830625292,
+        "amount": 5000
+      },
+      "contributor": {
+        "role_id": 1535961511275536477,
+        "amount": 10000
+      }
     },
     "collect_amounts": {
       "admin": 16000,
@@ -90,7 +150,7 @@
   "warn_ban_threshold": 7,
   "antinuke": {
     "enabled": true,
-    "message_spam_limit": 7,
+    "message_spam_limit": 3,
     "mention_limit": 5,
     "same_user_ping_limit": 8,
     "emoji_limit": 10,
@@ -103,8 +163,22 @@
     "phish_timeout_seconds": 600,
     "word_timeout_seconds": 300,
     "soft_mute_seconds": 60,
-    "warn_kick_threshold": 5
+    "warn_kick_threshold": 5,
+    "dup_msg_limit": 2,
+    "similarity_threshold": 0.85
   },
+  "admin_ticket": 1536187557023322172,
+  "event_ticket": 1536614150187261973,
+  "moderator_ticket": 1536614329733095455,
+  "ticket_category": 1535962130950651994,
+  "ticket_channel": 1535992504934072390,
+  "ticket_transcript": 1536188556261851208,
+  "afk_perm": 1558495339944616062,
+  "ghost_ping_perm": 1558495370978267307,
+  "ttt": 1558495392486654052,
+  "rps": 1558495426959904828,
+  "8ball": 1558495448698847312,
+  "russian_roulette_ping": 1558495526360711349,
   "antiphish_enabled": true,
   "wordfilter_enabled": true
 }
