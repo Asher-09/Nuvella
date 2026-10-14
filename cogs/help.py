@@ -18,18 +18,18 @@ EMOJI_WARNING = f"{EMOJIS['warning']}"  # not yet used, but available
 # ─── Commands hidden from the help menu ───────────────────────────
 # Add / remove command names here (plain name or qualified name).
 # Both `cmd.name` and `cmd.qualified_name` are checked.
+PUBLIC_COGS: set[str] = {"clan", "clans", "economy", "extra", "fun", "help", "server", "roles"}
+
 HIDDEN_COMMANDS: set = {
-        "role",
+        "role", "interestrate", "mgive", "mtake", "registeredusers", "cleareconomy", "customgreet", "trigger", "triggers", "mafia",
 }
 
 
 def _is_hidden(cmd: commands.Command) -> bool:
-    """Return True if a command should not appear in help."""
-    return (
-        cmd.hidden
-        or cmd.name in HIDDEN_COMMANDS
-        or cmd.qualified_name in HIDDEN_COMMANDS
-    )
+    """Return True if a command or one of its aliases is in the hide list."""
+    hidden = {str(name).casefold() for name in HIDDEN_COMMANDS}
+    candidates = [cmd.name, cmd.qualified_name, *getattr(cmd, "aliases", [])]
+    return bool(cmd.hidden or any(str(name).casefold() in hidden for name in candidates))
 
 
 with open("./config.json") as f:
@@ -60,6 +60,39 @@ class Help(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    def _is_staff(self, ctx: commands.Context) -> bool:
+        """Staff visibility check based on owner IDs and configured staff roles."""
+        author = ctx.author
+        if not ctx.guild or not isinstance(author, discord.Member):
+            return author.id == int(getattr(self.bot, "owner_id", 0) or 0)
+        if author.id == ctx.guild.owner_id or author.id == int(getattr(self.bot, "owner_id", 0) or 0):
+            return True
+        if author.guild_permissions.administrator:
+            return True
+        cfg = getattr(self.bot, "config", {}) or {}
+        role_ids = set()
+        for rid in cfg.get("staff_role_ids", []) or []:
+            try: role_ids.add(int(rid))
+            except (TypeError, ValueError): pass
+        roles = cfg.get("roles", {}) or {}
+        for key in ("admin_role_id", "senior_moderator_role_id", "moderator_role_id",
+                    "trial_moderator_role_id", "developer_role_id", "event_manager_role_id",
+                    "trial_event_manager_role_id"):
+            try:
+                if roles.get(key): role_ids.add(int(roles[key]))
+            except (TypeError, ValueError): pass
+        if any(role.id in role_ids for role in author.roles):
+            return True
+        return False
+
+    def _visible_cogs(self, ctx: commands.Context) -> list[str]:
+        """Cogs members can browse; staff see all categories."""
+        names = [name for name, cog in self.bot.cogs.items()
+                 if any(not _is_hidden(cmd) for cmd in cog.get_commands())]
+        if self._is_staff(ctx):
+            return sorted(names, key=str.casefold)
+        return sorted((n for n in names if n.casefold() in PUBLIC_COGS), key=str.casefold)
+
     # ─── Guild icon helper ───────────────────────────────────────
     def _guild_icon(self, ctx: commands.Context) -> Optional[str]:
         """Return the guild's icon URL, or None if unavailable."""
@@ -89,7 +122,7 @@ class Help(commands.Cog):
         embed = self.make_embed(ctx, f"{EMOJIS['help']} Help Center",
                                 f"**Total Members:** {member_count}\n**Prefix:** `{PREFIX}`",
                                 color=0xf1c40f)
-        cog_names = [name for name, cog in self.bot.cogs.items() if cog.get_commands()]
+        cog_names = self._visible_cogs(ctx)
         if cog_names:
             desc = ""
             for name in sorted(cog_names):
@@ -264,7 +297,7 @@ class Help(commands.Cog):
     async def help_command(self, ctx, *, query: Optional[str] = None):
         """Browse all commands or jump to a specific category/command."""
 
-        cog_names = sorted([name for name, cog in self.bot.cogs.items() if cog.get_commands()])
+        cog_names = self._visible_cogs(ctx)
         pages = [self.home_embed(ctx)]
         for name in cog_names:
             page = self.cog_page_embed(ctx, name)
@@ -284,7 +317,8 @@ class Help(commands.Cog):
                 return
 
             cmd = self.bot.get_command(query_lower)
-            if cmd and not _is_hidden(cmd):
+            allowed_cogs = {name.casefold() for name in cog_names}
+            if cmd and not _is_hidden(cmd) and (cmd.cog is None or cmd.cog.qualified_name.casefold() in allowed_cogs):
                 embed = self.command_embed(ctx, cmd)
                 await ctx.send(embed=embed)
                 return
