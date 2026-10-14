@@ -6,6 +6,7 @@ import os
 import random
 import re
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Sequence
@@ -17,12 +18,7 @@ from discord.ext import commands, tasks
 
 from utils.emoji import EMOJIS
 from utils.components import ComponentsV2View, prepare_v2_view, disable_all_components
-from rich.console import Console
-import rich
-from rich.panel import Panel
-from rich.text import Text
-
-console = Console()
+from utils.database import run_transaction
 
 _SECRET_PATTERN = re.compile(
     r"(postgres(?:ql)?://[^\s\"']+|Bot [A-Za-z0-9._-]{20,}|token[\"']?\s*[:=]\s*[\"']?[\w.\-]{20,})",
@@ -63,6 +59,8 @@ BUTTON_STYLE_MAP = {
 GREY_COLOR = 0x2B2D31
 # Default reroll window (hours) when none is provided
 DEFAULT_REROLL_HOURS = 24
+# Additional role that may use /giveaway start, edit, cancel, end only.
+GIVEAWAY_HOST_ROLE_ID = 1535961511275536477
 # ─────────────────────────────────────────────
 
 
@@ -88,6 +86,8 @@ class GiveawaySettings:
     button_label: str = "Enter Giveaway"
     required_message_count: int = 0
     required_message_period: str = MessageRequirementPeriod.DAILY.value
+    message_from_giveaway: bool = False
+    invite_mode: bool = False
     required_join_age_days: int = 0
     required_invite_count: Optional[int] = None
     required_level: Optional[int] = None
@@ -133,6 +133,8 @@ CREATE TABLE IF NOT EXISTS giveaways (
     winner_count                INTEGER NOT NULL CHECK (winner_count > 0),
     required_message_count      INTEGER NOT NULL DEFAULT 0,
     required_message_period     TEXT NOT NULL DEFAULT 'daily',
+    message_from_giveaway      BOOLEAN NOT NULL DEFAULT FALSE,
+    invite_mode                BOOLEAN NOT NULL DEFAULT FALSE,
     required_join_age_days      INTEGER NOT NULL DEFAULT 0,
     required_invite_count       INTEGER,
     required_level              INTEGER,
@@ -208,16 +210,19 @@ CREATE TABLE IF NOT EXISTS giveaway_logs (
 
 CREATE INDEX IF NOT EXISTS idx_logs_guild ON giveaway_logs(guild_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_giveaway ON giveaway_logs(giveaway_id);
+
+CREATE TABLE IF NOT EXISTS giveaway_message_counts (
+    giveaway_id BIGINT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (giveaway_id, user_id)
+);
 """
 
 
-def _format_error(title: str, message: str) -> Panel:
-    """Format error for rich console output."""
-    return Panel(
-        Text(_sanitize(f"{message}"), style="red"),
-        title=f"[bold red]{EMOJIS['x']} {title}[/bold red]",
-        border_style="red",
-    )
+def _format_error(title: str, message: str) -> str:
+    """Format a structured error for the central logging handlers."""
+    return f"{EMOJIS['x']} {title} | {_sanitize(str(message))}"
 
 
 def _config_get(key: str, default: Any = None, config: Any = None) -> Any:
@@ -284,38 +289,30 @@ class GiveawayRepo:
 
     async def bootstrap(self) -> None:
         try:
-            async with self.pool.acquire() as conn:
+            async def operation(conn):
                 await conn.execute(SCHEMA_SQL)
-                await self._ensure_columns()
-        except Exception as e:
-            console.print(_format_error("Database Error", f"Failed to bootstrap database: {e}"))
+                await self._ensure_columns(conn)
+            await run_transaction(self.pool, operation, label="giveaway.bootstrap")
+            logging.getLogger("nuvella.database").info("Giveaway schema bootstrap complete")
+        except Exception:
+            logging.getLogger("nuvella.database").exception("Giveaway schema bootstrap failed")
+            raise
 
-    async def _ensure_columns(self) -> None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='giveaways' AND column_name='sponsor'"
+    async def _ensure_columns(self, conn: asyncpg.Connection) -> None:
+        # Additive migrations preserve existing giveaway data and are safe to rerun.
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS sponsor TEXT")
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS reroll_hours INTEGER NOT NULL DEFAULT 24")
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS use_global_blacklist BOOLEAN NOT NULL DEFAULT TRUE")
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS message_from_giveaway BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS invite_mode BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS giveaway_message_counts (
+                giveaway_id BIGINT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (giveaway_id, user_id)
             )
-            if not row:
-                await conn.execute("ALTER TABLE giveaways ADD COLUMN sponsor TEXT")
-
-            row = await conn.fetchrow(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='giveaways' AND column_name='reroll_hours'"
-            )
-            if not row:
-                await conn.execute(
-                    "ALTER TABLE giveaways ADD COLUMN reroll_hours INTEGER NOT NULL DEFAULT 24"
-                )
-
-            row = await conn.fetchrow(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='giveaways' AND column_name='use_global_blacklist'"
-            )
-            if not row:
-                await conn.execute(
-                    "ALTER TABLE giveaways ADD COLUMN use_global_blacklist BOOLEAN NOT NULL DEFAULT TRUE"
-                )
+        """)
 
     async def get_guild_settings(self, guild_id: int) -> Optional[asyncpg.Record]:
         async with self.pool.acquire() as conn:
@@ -336,36 +333,37 @@ class GiveawayRepo:
             await conn.execute(query, guild_id, *kwargs.values())
 
     async def create_giveaway(self, s: GiveawaySettings, end_time: datetime) -> int:
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO giveaways (
-                        guild_id, channel_id, host_id, host_display_name, prize, description,
-                        message, thumbnail_url, image_url, gif_url, video_url, color,
-                        button_style, button_emoji, button_label, winner_count,
-                        required_message_count, required_message_period,
-                        required_join_age_days,
-                        required_invite_count, required_level, required_booster, required_nitro,
-                        winner_role_id, custom_timestamp, end_time,
-                        sponsor, reroll_hours, use_global_blacklist
-                    ) VALUES (
-                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-                        $20,$21,$22,$23,$24,$25,$26,$27,$28,$29
-                    ) RETURNING id
-                    """,
-                    s.guild_id, s.channel_id, s.host_id, s.author, s.prize,
-                    s.description, s.message, s.thumbnail_url, s.image_url,
-                    s.gif_url, s.video_url, s.color, s.button_style, s.button_emoji,
-                    s.button_label, s.winner_count, s.required_message_count,
-                    s.required_message_period, s.required_join_age_days,
-                    s.required_invite_count, s.required_level, s.required_booster,
-                    s.required_nitro, s.winner_role_id, s.custom_timestamp, end_time,
-                    s.sponsor, s.reroll_hours, s.use_global_blacklist,
-                )
-                giveaway_id = row["id"]
-                await self._insert_role_lists(conn, giveaway_id, s)
-                return giveaway_id
+        async def operation(conn):
+            row = await conn.fetchrow(
+                """
+                INSERT INTO giveaways (
+                    guild_id, channel_id, host_id, host_display_name, prize, description,
+                    message, thumbnail_url, image_url, gif_url, video_url, color,
+                    button_style, button_emoji, button_label, winner_count,
+                    required_message_count, required_message_period,
+                    required_join_age_days, message_from_giveaway, invite_mode,
+                    required_invite_count, required_level, required_booster, required_nitro,
+                    winner_role_id, custom_timestamp, end_time,
+                    sponsor, reroll_hours, use_global_blacklist
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                    $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31
+                ) RETURNING id
+                """,
+                s.guild_id, s.channel_id, s.host_id, s.author, s.prize,
+                s.description, s.message, s.thumbnail_url, s.image_url,
+                s.gif_url, s.video_url, s.color, s.button_style, s.button_emoji,
+                s.button_label, s.winner_count, s.required_message_count,
+                s.required_message_period, s.required_join_age_days,
+                s.message_from_giveaway, s.invite_mode,
+                s.required_invite_count, s.required_level, s.required_booster,
+                s.required_nitro, s.winner_role_id, s.custom_timestamp, end_time,
+                s.sponsor, s.reroll_hours, s.use_global_blacklist,
+            )
+            giveaway_id = row["id"]
+            await self._insert_role_lists(conn, giveaway_id, s)
+            return giveaway_id
+        return await run_transaction(self.pool, operation, label="giveaway.create")
 
     async def _insert_role_lists(
         self, conn: asyncpg.Connection, giveaway_id: int, s: GiveawaySettings
@@ -435,18 +433,18 @@ class GiveawayRepo:
     async def replace_role_list(
         self, giveaway_id: int, list_type: RoleListType, role_ids: Sequence[int]
     ) -> None:
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM giveaway_roles WHERE giveaway_id = $1 AND list_type = $2",
-                    giveaway_id, list_type.value,
+        async def operation(conn):
+            await conn.execute(
+                "DELETE FROM giveaway_roles WHERE giveaway_id=$1 AND list_type=$2",
+                giveaway_id, list_type.value,
+            )
+            if role_ids:
+                await conn.executemany(
+                    "INSERT INTO giveaway_roles (giveaway_id, role_id, list_type) "
+                    "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                    [(giveaway_id, rid, list_type.value) for rid in sorted(set(role_ids))],
                 )
-                if role_ids:
-                    await conn.executemany(
-                        "INSERT INTO giveaway_roles (giveaway_id, role_id, list_type) "
-                        "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                        [(giveaway_id, r, list_type.value) for r in role_ids],
-                    )
+        await run_transaction(self.pool, operation, label="giveaway.replace_role_list")
 
     async def set_status(self, giveaway_id: int, status: GiveawayStatus) -> None:
         async with self.pool.acquire() as conn:
@@ -555,31 +553,51 @@ class GiveawayRepo:
     async def flush_message_counts(self, deltas: dict[tuple[int, int], int]) -> None:
         if not deltas:
             return
-        rows = sorted((g, u, c) for (g, u), c in deltas.items())
+        # Stable ordering reduces lock inversion risk for batches that overlap.
+        rows = sorted((guild_id, user_id, count)
+                      for (guild_id, user_id), count in deltas.items() if count > 0)
+        if not rows:
+            return
 
-        max_retries = 5
-        retry_delay = 0.1
-        for attempt in range(max_retries):
-            try:
-                async with self.pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.executemany(
-                            """
-                            INSERT INTO user_message_counts (guild_id, user_id, daily_count, weekly_count, lifetime_count)
-                            VALUES ($1, $2, $3, $3, $3)
-                            ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                                daily_count = user_message_counts.daily_count + EXCLUDED.daily_count,
-                                weekly_count = user_message_counts.weekly_count + EXCLUDED.weekly_count,
-                                lifetime_count = user_message_counts.lifetime_count + EXCLUDED.lifetime_count
-                            """,
-                            rows,
-                        )
-                return
-            except asyncpg.exceptions.DeadlockDetectedError:
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2
+        async def operation(conn):
+            await conn.executemany(
+                """INSERT INTO user_message_counts
+                       (guild_id, user_id, daily_count, weekly_count, lifetime_count)
+                   VALUES ($1, $2, $3, $3, $3)
+                   ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                       daily_count = user_message_counts.daily_count + EXCLUDED.daily_count,
+                       weekly_count = user_message_counts.weekly_count + EXCLUDED.weekly_count,
+                       lifetime_count = user_message_counts.lifetime_count + EXCLUDED.lifetime_count""",
+                rows,
+            )
+
+        await run_transaction(self.pool, operation, label="giveaway.flush_message_counts")
+
+    async def flush_giveaway_message_counts(self, deltas: dict[tuple[int, int], int]) -> None:
+        if not deltas:
+            return
+        rows = sorted((giveaway_id, user_id, count)
+                      for (giveaway_id, user_id), count in deltas.items() if count > 0)
+        if not rows:
+            return
+
+        async def operation(conn):
+            await conn.executemany(
+                """INSERT INTO giveaway_message_counts (giveaway_id, user_id, message_count)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (giveaway_id, user_id) DO UPDATE
+                   SET message_count = giveaway_message_counts.message_count + EXCLUDED.message_count""",
+                rows,
+            )
+
+        await run_transaction(self.pool, operation, label="giveaway.flush_giveaway_message_counts")
+
+    async def get_giveaway_message_count(self, giveaway_id: int, user_id: int) -> int:
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval(
+                "SELECT message_count FROM giveaway_message_counts WHERE giveaway_id=$1 AND user_id=$2",
+                giveaway_id, user_id,
+            ) or 0)
 
     async def get_message_count(self, guild_id: int, user_id: int, period: str) -> int:
         col = {"daily": "daily_count", "weekly": "weekly_count", "lifetime": "lifetime_count"}[period]
@@ -641,18 +659,17 @@ class GiveawayRepo:
             )
 
     async def clear_all_giveaway_data(self) -> None:
-        """Clear ALL giveaway data except user_message_counts."""
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM giveaway_entries")
-                await conn.execute("DELETE FROM giveaway_winners")
-                await conn.execute("DELETE FROM giveaway_roles")
-                await conn.execute("DELETE FROM giveaway_logs")
-                await conn.execute("DELETE FROM giveaways")
-                await conn.execute("ALTER SEQUENCE giveaways_id_seq RESTART WITH 1")
-                await conn.execute("ALTER SEQUENCE giveaway_entries_id_seq RESTART WITH 1")
-                await conn.execute("ALTER SEQUENCE giveaway_winners_id_seq RESTART WITH 1")
-                await conn.execute("ALTER SEQUENCE giveaway_logs_id_seq RESTART WITH 1")
+        """Clear all giveaway rows except user_message_counts atomically."""
+        async def operation(conn):
+            # Child/association tables first, parent last.
+            for table in ("giveaway_entries", "giveaway_winners", "giveaway_roles",
+                          "giveaway_message_counts", "giveaway_logs", "giveaways"):
+                await conn.execute(f"DELETE FROM {table}")
+            await conn.execute("ALTER SEQUENCE giveaways_id_seq RESTART WITH 1")
+            await conn.execute("ALTER SEQUENCE giveaway_entries_id_seq RESTART WITH 1")
+            await conn.execute("ALTER SEQUENCE giveaway_winners_id_seq RESTART WITH 1")
+            await conn.execute("ALTER SEQUENCE giveaway_logs_id_seq RESTART WITH 1")
+        await run_transaction(self.pool, operation, label="giveaway.clear_all")
 
 
 def build_giveaway_embed(
@@ -897,7 +914,7 @@ class WinnerConfirmView(discord.ui.View):
                 "It seems you'd like to keep the prize.\n\n"
                 f"Please contact the {EMOJIS['mail']} Event Team by opening an event "
                 "ticket for your winning prize.\n\n"
-                "**Objective** — Open a ticket through <#1535992504934072390>"
+                "**Objective** — Open a ticket through <#1535962074415505510>"
             ),
             color=discord.Color(GREY_COLOR),
         )
@@ -906,7 +923,7 @@ class WinnerConfirmView(discord.ui.View):
         try:
             await interaction.response.edit_message(embed=second_embed, view=None)
         except (discord.NotFound, discord.HTTPException) as e:
-            console.print(_format_error(f"Winner DM Edit #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Winner DM Edit #{row['id']}", str(e)))
 
         try:
             await self.cog.repo.mark_winner_dm(row["id"], self.member.id, True)
@@ -915,7 +932,7 @@ class WinnerConfirmView(discord.ui.View):
                 giveaway_id=row["id"], user_id=self.member.id,
             )
         except Exception as e:
-            console.print(_format_error(f"Winner DM Mark #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Winner DM Mark #{row['id']}", str(e)))
 
         self.stop()
 
@@ -927,7 +944,7 @@ class WinnerConfirmView(discord.ui.View):
         try:
             await self.cog._notify_host_cancellation(guild, row, self.member, "reroll")
         except Exception as e:
-            console.print(_format_error(f"Reroll Notify #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Reroll Notify #{row['id']}", str(e)))
 
         response_embed = discord.Embed(
             title="Response recorded",
@@ -941,7 +958,7 @@ class WinnerConfirmView(discord.ui.View):
         try:
             await interaction.response.edit_message(embed=response_embed, view=None)
         except (discord.NotFound, discord.HTTPException) as e:
-            console.print(_format_error(f"Winner DM Edit #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Winner DM Edit #{row['id']}", str(e)))
 
         try:
             await self.cog.repo.mark_winner_dm(row["id"], self.member.id, True)
@@ -950,7 +967,7 @@ class WinnerConfirmView(discord.ui.View):
                 giveaway_id=row["id"], user_id=self.member.id, action="reroll",
             )
         except Exception as e:
-            console.print(_format_error(f"Winner DM Log #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Winner DM Log #{row['id']}", str(e)))
 
         self.stop()
 
@@ -973,8 +990,10 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         self.pool = pool
         self.repo = GiveawayRepo(pool)
         self._message_cache: dict[tuple[int, int], int] = {}
+        self._giveaway_message_cache: dict[tuple[int, int], int] = {}
         self._message_cache_lock = asyncio.Lock()
         self._ending_locks: dict[int, asyncio.Lock] = {}
+        self._active_message_giveaways: dict[int, dict[int, int]] = {}
 
     async def cog_load(self) -> None:
         await self.repo.bootstrap()
@@ -989,10 +1008,18 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         self.reset_counts_task.cancel()
         await self._flush_message_cache()
 
-    async def _has_permission(self, interaction: discord.Interaction) -> bool:
+    async def _has_permission(
+        self, interaction: discord.Interaction, allow_host_role: bool = False
+    ) -> bool:
         """
-        Only event managers, senior moderators, admins, and (as a safety net)
-        users with the Administrator permission may manage giveaways.
+        Permission gate for giveaway commands.
+
+        Base managers (always allowed): event manager, senior moderator, admin
+        roles from config, or any user with the Discord Administrator permission.
+
+        When ``allow_host_role`` is True (used only by ``start``, ``edit``,
+        ``cancel``, and ``end``), members holding ``GIVEAWAY_HOST_ROLE_ID`` are
+        also permitted.
         """
         if not isinstance(interaction.user, discord.Member):
             return False
@@ -1004,12 +1031,19 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         if interaction.user.guild_permissions.administrator:
             return True
 
+        if allow_host_role and any(
+            role.id == GIVEAWAY_HOST_ROLE_ID for role in interaction.user.roles
+        ):
+            return True
+
         return False
 
     async def _restore_persistent_views(self) -> None:
         try:
             rows = await self.repo.list_active_giveaways()
             for row in rows:
+                if row.get("message_from_giveaway") and int(row.get("required_message_count") or 0) > 0:
+                    self._active_message_giveaways.setdefault(int(row["guild_id"]), {})[int(row["id"])] = int(row["required_message_count"])
                 view = GiveawayJoinView(
                     self, row["id"], row["button_style"], row["button_emoji"], row["button_label"]
                 )
@@ -1017,7 +1051,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                     view, message_id=row["message_id"] if row["message_id"] else None
                 )
         except Exception as e:
-            console.print(_format_error("View Restoration Failed", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("View Restoration Failed", str(e)))
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1026,24 +1060,47 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         key = (message.guild.id, message.author.id)
         async with self._message_cache_lock:
             self._message_cache[key] = self._message_cache.get(key, 0) + 1
+            for giveaway_id in self._active_message_giveaways.get(message.guild.id, {}):
+                gw_key = (giveaway_id, message.author.id)
+                self._giveaway_message_cache[gw_key] = self._giveaway_message_cache.get(gw_key, 0) + 1
 
     @tasks.loop(seconds=FLUSH_INTERVAL_SECONDS)
     async def flush_message_cache_task(self) -> None:
         await self._flush_message_cache()
 
     async def _flush_message_cache(self) -> None:
+        """Flush both caches without a temporary under-count or dropped increments.
+
+        The shared lock is held until persistence finishes. Message listeners wait
+        briefly instead of adding new deltas while a previous snapshot is being
+        committed, so a successful flush can clear exactly the values it wrote.
+        On failure the cache stays intact for the next retry.
+        """
         async with self._message_cache_lock:
-            if not self._message_cache:
-                return
-            deltas = self._message_cache
-            self._message_cache = {}
-        try:
-            await self.repo.flush_message_counts(deltas)
-        except Exception as e:
-            async with self._message_cache_lock:
-                for key, count in deltas.items():
-                    self._message_cache[key] = self._message_cache.get(key, 0) + count
-            console.print(_format_error("Message Cache Flush Failed", str(e)))
+            if self._message_cache:
+                try:
+                    await self.repo.flush_message_counts(dict(self._message_cache))
+                    self._message_cache.clear()
+                except Exception:
+                    logging.getLogger("nuvella.database").exception(
+                        "General giveaway-message count flush failed; cache retained"
+                    )
+                    logging.getLogger("nuvella.giveaway").error("%s", _format_error(
+                        "Message Cache Flush Failed",
+                        "General message counts were retained for retry; see logs/errors.log",
+                    ))
+            if self._giveaway_message_cache:
+                try:
+                    await self.repo.flush_giveaway_message_counts(dict(self._giveaway_message_cache))
+                    self._giveaway_message_cache.clear()
+                except Exception:
+                    logging.getLogger("nuvella.database").exception(
+                        "Giveaway-specific message count flush failed; cache retained"
+                    )
+                    logging.getLogger("nuvella.giveaway").error("%s", _format_error(
+                        "Giveaway Message Cache Flush Failed",
+                        "Giveaway message counts were retained for retry; see logs/errors.log",
+                    ))
 
     @tasks.loop(hours=1)
     async def reset_counts_task(self) -> None:
@@ -1051,14 +1108,14 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             await self.repo.reset_daily_counts()
             await self.repo.reset_weekly_counts()
         except Exception as e:
-            console.print(_format_error("Count Reset Failed", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Count Reset Failed", str(e)))
 
     @tasks.loop(seconds=SCHEDULER_INTERVAL_SECONDS)
     async def scheduler_task(self) -> None:
         try:
             due = await self.repo.list_due_giveaways()
         except Exception as e:
-            console.print(_format_error("Scheduler Fetch Failed", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Scheduler Fetch Failed", str(e)))
             return
         for row in due:
             asyncio.create_task(self._end_giveaway_safe(row["id"]))
@@ -1070,16 +1127,23 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         await self.bot.wait_until_ready()
 
     async def _end_giveaway_safe(self, giveaway_id: int) -> None:
+        # Keep the per-giveaway lock in the map while waiters may still hold a
+        # reference to it. Removing it in a finally block can let a third task
+        # create a new lock and overlap the task already waiting on the old one.
         lock = self._ending_locks.setdefault(giveaway_id, asyncio.Lock())
         if lock.locked():
-            return
+            return  # another scheduler/manual end is already handling this ID
         async with lock:
             try:
                 await self.end_giveaway(giveaway_id, is_manual=False)
-            except Exception as e:
-                console.print(_format_error(f"End Giveaway #{giveaway_id}", str(e)))
-            finally:
-                self._ending_locks.pop(giveaway_id, None)
+            except Exception:
+                logging.getLogger("nuvella.giveaway").exception(
+                    "Automatic end failed | giveaway_id=%s", giveaway_id
+                )
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(
+                    f"End Giveaway #{giveaway_id}",
+                    "Automatic end failed; see logs/errors.log",
+                ))
 
     async def _check_eligibility(
         self, member: discord.Member, row: asyncpg.Record, role_lists: dict[str, list[int]]
@@ -1111,15 +1175,32 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             if age < timedelta(days=row["required_join_age_days"]):
                 return False, "You have not been in this server long enough."
 
+        if row["required_invite_count"] is not None and int(row["required_invite_count"]) > 0:
+            tracker = self.bot.get_cog("InviteTracker")
+            invite_count = await tracker.get_invite_count(member.guild.id, member.id) if tracker else 0
+            if invite_count < int(row["required_invite_count"]):
+                return False, f"You need at least {row['required_invite_count']} tracked invite(s) to enter."
+
         if row["required_message_count"] > 0:
-            count = await self.repo.get_message_count(
-                member.guild.id, member.id, row["required_message_period"]
-            )
-            count += self._message_cache.get((member.guild.id, member.id), 0)
+            # Read the persisted count and its in-memory delta under the same lock
+            # used by the flusher. Otherwise a join click could observe the DB
+            # after its update but before the cache clears and count messages twice.
+            async with self._message_cache_lock:
+                if row.get("message_from_giveaway", False):
+                    giveaway_id = int(row["id"])
+                    count = await self.repo.get_giveaway_message_count(giveaway_id, member.id)
+                    count += self._giveaway_message_cache.get((giveaway_id, member.id), 0)
+                    message_rule = "since this giveaway started"
+                else:
+                    count = await self.repo.get_message_count(
+                        member.guild.id, member.id, row["required_message_period"]
+                    )
+                    count += self._message_cache.get((member.guild.id, member.id), 0)
+                    message_rule = row["required_message_period"]
             if count < row["required_message_count"]:
                 return False, (
                     f"You need at least {row['required_message_count']} messages "
-                    f"({row['required_message_period']}) to enter."
+                    f"({message_rule}) to enter. You have {count}."
                 )
 
         return True, None
@@ -1130,7 +1211,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         except discord.NotFound:
             return
         except discord.HTTPException as e:
-            console.print(_format_error("Join Defer Failed", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Join Defer Failed", str(e)))
             return
 
         try:
@@ -1170,7 +1251,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             )
             await self._refresh_message(giveaway_id)
         except Exception as e:
-            console.print(_format_error(f"Join Giveaway #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Join Giveaway #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     async def handle_leave_click(self, interaction: discord.Interaction, giveaway_id: int) -> None:
@@ -1179,7 +1260,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         except discord.NotFound:
             return
         except discord.HTTPException as e:
-            console.print(_format_error("Leave Defer Failed", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Leave Defer Failed", str(e)))
             return
 
         try:
@@ -1201,7 +1282,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             else:
                 await interaction.followup.send("You were not entered in this giveaway.", ephemeral=True)
         except Exception as e:
-            console.print(_format_error(f"Leave Giveaway #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Leave Giveaway #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     async def _refresh_message(self, giveaway_id: int) -> None:
@@ -1220,7 +1301,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             except discord.NotFound:
                 return
             except discord.HTTPException as e:
-                console.print(_format_error(f"Refresh Fetch #{giveaway_id}", str(e)))
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Refresh Fetch #{giveaway_id}", str(e)))
                 return
 
             role_lists = await self.repo.get_role_lists(giveaway_id)
@@ -1251,9 +1332,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 prepare_v2_view(view, embed)
                 await message.edit(view=view)
             except discord.HTTPException as e:
-                console.print(_format_error(f"Refresh Edit #{giveaway_id}", str(e)))
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Refresh Edit #{giveaway_id}", str(e)))
         except Exception as e:
-            console.print(_format_error(f"Refresh Message #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Refresh Message #{giveaway_id}", str(e)))
 
     async def _select_winners(
         self,
@@ -1280,8 +1361,24 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         if not candidates:
             return []
 
-        k = min(count, len(candidates))
-        return random.SystemRandom().sample(candidates, k)
+        rng = random.SystemRandom()
+        if not row.get("invite_mode", False):
+            return rng.sample(candidates, min(count, len(candidates)))
+
+        # Each recorded invite contributes two additional tickets to the pool.
+        # A member can only win once per draw; after selection their name is removed.
+        tracker = self.bot.get_cog("InviteTracker")
+        pool = list(candidates)
+        winners: list[discord.Member] = []
+        while pool and len(winners) < count:
+            weights = []
+            for member in pool:
+                invite_count = await tracker.get_invite_count(guild.id, member.id) if tracker else 0
+                weights.append(1 + (2 * max(0, int(invite_count))))
+            picked = rng.choices(pool, weights=weights, k=1)[0]
+            winners.append(picked)
+            pool.remove(picked)
+        return winners
 
     async def end_giveaway(self, giveaway_id: int, is_manual: bool) -> list[discord.Member]:
         try:
@@ -1292,12 +1389,16 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             guild = self.bot.get_guild(row["guild_id"])
             if guild is None:
                 await self.repo.set_status(giveaway_id, GiveawayStatus.ENDED)
+                async with self._message_cache_lock:
+                    self._active_message_giveaways.get(int(row["guild_id"]), {}).pop(giveaway_id, None)
                 return []
 
             winners = await self._select_winners(
                 guild, giveaway_id, row, row["winner_count"], exclude=set()
             )
             await self.repo.set_status(giveaway_id, GiveawayStatus.ENDED)
+            async with self._message_cache_lock:
+                self._active_message_giveaways.get(int(row["guild_id"]), {}).pop(giveaway_id, None)
             if winners:
                 await self.repo.record_winners(giveaway_id, [w.id for w in winners], is_reroll=False)
 
@@ -1307,7 +1408,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                     msg = await channel.fetch_message(row["message_id"])
                     await msg.delete()
                 except (discord.NotFound, discord.HTTPException) as e:
-                    console.print(_format_error(f"Delete Message #{giveaway_id}", str(e)))
+                    logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Delete Message #{giveaway_id}", str(e)))
 
             if channel is not None:
                 if winners:
@@ -1350,7 +1451,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             )
             return winners
         except Exception as e:
-            console.print(_format_error(f"End Giveaway #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"End Giveaway #{giveaway_id}", str(e)))
             return []
 
     async def _handle_winner_dm_interaction(
@@ -1385,13 +1486,13 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 dm_message = await member.send(embed=prompt_embed, view=view)
                 view.message = dm_message
             except (discord.Forbidden, discord.HTTPException) as e:
-                console.print(
+                logging.getLogger("nuvella.giveaway").error("%s",
                     _format_error(f"DM Prompt #{row['id']}", f"Failed to DM {member}: {e}")
                 )
                 await self._notify_staff_dm_failed(guild, row, member)
                 return
         except Exception as e:
-            console.print(_format_error(f"Winner DM #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Winner DM #{row['id']}", str(e)))
 
     async def _notify_staff_dm_failed(
         self, guild: discord.Guild, row: asyncpg.Record, member: discord.Member
@@ -1412,7 +1513,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                     )
                     await channel.send(embed=embed)
         except Exception as e:
-            console.print(_format_error(f"Staff DM Failed #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Staff DM Failed #{row['id']}", str(e)))
 
     async def _notify_host_cancellation(
         self,
@@ -1438,7 +1539,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                     await host.send(embed=embed)
                     return
                 except (discord.Forbidden, discord.HTTPException) as e:
-                    console.print(_format_error(f"Host DM #{row['id']}", str(e)))
+                    logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Host DM #{row['id']}", str(e)))
 
             settings = await self.repo.get_guild_settings(guild.id)
             if settings and settings.get("staff_channel_id"):
@@ -1449,7 +1550,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                     )
                     return
         except Exception as e:
-            console.print(_format_error(f"Response Notify #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Response Notify #{row['id']}", str(e)))
 
     async def _assign_winner_role(self, member: discord.Member, role_id: int) -> bool:
         try:
@@ -1460,15 +1561,15 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await member.add_roles(role, reason="Giveaway winner role assignment")
                 return True
             except discord.Forbidden:
-                console.print(
+                logging.getLogger("nuvella.giveaway").error("%s",
                     _format_error("Role Assign Forbidden", f"Could not assign role {role_id} to {member}")
                 )
                 return False
             except discord.HTTPException as e:
-                console.print(_format_error(f"Role Assign {role_id}", str(e)))
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Role Assign {role_id}", str(e)))
                 return False
         except Exception as e:
-            console.print(_format_error(f"Role Assign {role_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Role Assign {role_id}", str(e)))
             return False
 
     async def _notify_staff(
@@ -1511,9 +1612,9 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             try:
                 await channel.send(embed=embed)
             except discord.HTTPException as e:
-                console.print(_format_error(f"Notify Staff #{row['id']}", str(e)))
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Notify Staff #{row['id']}", str(e)))
         except Exception as e:
-            console.print(_format_error(f"Notify Staff #{row['id']}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Notify Staff #{row['id']}", str(e)))
 
     def _parse_duration(self, text: str) -> Optional[int]:
         pattern = re.compile(r"(\d+)\s*(d|h|m|s)", re.IGNORECASE)
@@ -1613,6 +1714,8 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         sponsor="Name of the sponsor (displayed in embed)",
         mention_role="Role to ping in a separate message before the embed",
         use_global_blacklist="Whether to apply the server-wide blacklist (default: True)",
+        invite_mode="Give each tracked invite two extra winner tickets",
+        message_from_giveaway="Count only messages sent after this giveaway starts",
     )
     @app_commands.choices(
         message_period=[
@@ -1652,8 +1755,11 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         sponsor: Optional[str] = None,
         mention_role: Optional[discord.Role] = None,
         use_global_blacklist: Optional[bool] = True,
+        invite_mode: Optional[bool] = False,
+        message_from_giveaway: Optional[bool] = False,
     ) -> None:
-        if not await self._has_permission(interaction):
+        # ``start`` also accepts the giveaway host role (see _has_permission).
+        if not await self._has_permission(interaction, allow_host_role=True):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
             )
@@ -1664,7 +1770,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         except discord.NotFound:
             return
         except discord.HTTPException as e:
-            console.print(_format_error("Start Defer", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Start Defer", str(e)))
             return
 
         guild = interaction.guild
@@ -1688,6 +1794,12 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             if author is None:
                 author = interaction.user.display_name
 
+            if message_from_giveaway and not (required_messages or 0):
+                await interaction.followup.send(
+                    "Set `required_messages` above 0 when using `message_from_giveaway`.", ephemeral=True
+                )
+                return
+
             global_blacklist = _get_global_blacklist(self.bot.config)
             parsed_blacklist = self._parse_role_list(guild, blacklist_roles)
 
@@ -1709,6 +1821,8 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 button_emoji=button_emoji,
                 button_label=button_label or "Enter Giveaway",
                 required_message_count=required_messages or 0,
+                message_from_giveaway=bool(message_from_giveaway),
+                invite_mode=bool(invite_mode),
                 required_message_period=(
                     message_period.value if message_period else MessageRequirementPeriod.DAILY.value
                 ),
@@ -1735,7 +1849,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 try:
                     await target_channel.send(f"{mention_role.mention} A new giveaway has started!")
                 except discord.HTTPException as e:
-                    console.print(_format_error(f"Mention Role #{giveaway_id}", str(e)))
+                    logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Mention Role #{giveaway_id}", str(e)))
 
             view = GiveawayJoinView(
                 self, giveaway_id, settings.button_style, settings.button_emoji, settings.button_label
@@ -1745,13 +1859,17 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 prepare_v2_view(view, embed)
                 message = await target_channel.send(view=view)
             except discord.HTTPException as e:
-                console.print(_format_error(f"Start Send #{giveaway_id}", str(e)))
+                logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Start Send #{giveaway_id}", str(e)))
                 await interaction.followup.send(
                     "I couldn't post the giveaway message — check my permissions in that channel.",
                     ephemeral=True,
                 )
                 return
 
+            if fake_row and fake_row.get("message_from_giveaway") and int(fake_row.get("required_message_count") or 0) > 0:
+                # The requirement starts only after the public giveaway message exists.
+                async with self._message_cache_lock:
+                    self._active_message_giveaways.setdefault(guild.id, {})[giveaway_id] = int(fake_row["required_message_count"])
             await self.repo.set_message_id(giveaway_id, message.id)
             await self.repo.log(guild.id, "started", giveaway_id=giveaway_id, host=interaction.user.id)
 
@@ -1759,12 +1877,13 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 f"Giveaway **#{giveaway_id}** started in {target_channel.mention}.", ephemeral=True
             )
         except Exception as e:
-            console.print(_format_error("Start Giveaway", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Start Giveaway", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="end", description="End a giveaway immediately")
     async def end(self, interaction: discord.Interaction, giveaway_id: int) -> None:
-        if not await self._has_permission(interaction):
+        # ``end`` also accepts the giveaway host role (see _has_permission).
+        if not await self._has_permission(interaction, allow_host_role=True):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
             )
@@ -1789,12 +1908,13 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 f"Giveaway **#{giveaway_id}** ended. Winners: {summary}", ephemeral=True
             )
         except Exception as e:
-            console.print(_format_error(f"End Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"End Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="cancel", description="Cancel a giveaway without selecting winners")
     async def cancel(self, interaction: discord.Interaction, giveaway_id: int) -> None:
-        if not await self._has_permission(interaction):
+        # ``cancel`` also accepts the giveaway host role (see _has_permission).
+        if not await self._has_permission(interaction, allow_host_role=True):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
             )
@@ -1814,13 +1934,15 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await interaction.followup.send("That giveaway is not active.", ephemeral=True)
                 return
             await self.repo.set_status(giveaway_id, GiveawayStatus.CANCELLED)
+            async with self._message_cache_lock:
+                self._active_message_giveaways.get(int(row["guild_id"]), {}).pop(giveaway_id, None)
             await self._refresh_message(giveaway_id)
             await self.repo.log(
                 interaction.guild_id, "cancelled", giveaway_id=giveaway_id, by=interaction.user.id
             )
             await interaction.followup.send(f"Giveaway **#{giveaway_id}** cancelled.", ephemeral=True)
         except Exception as e:
-            console.print(_format_error(f"Cancel Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Cancel Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="reroll", description="Reroll winners for an ended giveaway")
@@ -1830,6 +1952,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         giveaway_id: int,
         count: Optional[app_commands.Range[int, 1, 100]] = None,
     ) -> None:
+        # NOTE: reroll does NOT accept the giveaway host role.
         if not await self._has_permission(interaction):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
@@ -1883,7 +2006,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 ephemeral=True,
             )
         except Exception as e:
-            console.print(_format_error(f"Reroll Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Reroll Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="edit", description="Edit an active giveaway")
@@ -1915,7 +2038,8 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
         winner_role: Optional[discord.Role] = None,
         use_global_blacklist: Optional[bool] = None,
     ) -> None:
-        if not await self._has_permission(interaction):
+        # ``edit`` also accepts the giveaway host role (see _has_permission).
+        if not await self._has_permission(interaction, allow_host_role=True):
             await interaction.response.send_message(
                 "You don't have permission to use this command.", ephemeral=True
             )
@@ -2009,7 +2133,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             )
             await interaction.followup.send(f"Giveaway **#{giveaway_id}** updated.", ephemeral=True)
         except Exception as e:
-            console.print(_format_error(f"Edit Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Edit Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="list", description="List active giveaways in this server")
@@ -2036,7 +2160,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             ]
             await interaction.followup.send("\n".join(lines), ephemeral=True)
         except Exception as e:
-            console.print(_format_error("List Giveaways", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("List Giveaways", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="info", description="Show details about a giveaway")
@@ -2069,7 +2193,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
-            console.print(_format_error(f"Info Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Info Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="entrants", description="List entrants for a giveaway (paginated)")
@@ -2108,7 +2232,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 ephemeral=True,
             )
         except Exception as e:
-            console.print(_format_error(f"Entrants Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Entrants Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="refresh", description="Force-refresh a giveaway's embed message")
@@ -2132,7 +2256,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             await self._refresh_message(giveaway_id)
             await interaction.followup.send("Refreshed.", ephemeral=True)
         except Exception as e:
-            console.print(_format_error(f"Refresh Command #{giveaway_id}", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error(f"Refresh Command #{giveaway_id}", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(
@@ -2173,7 +2297,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 await self.repo.upsert_guild_settings(guild.id, **updates)
             await interaction.followup.send("Settings updated.", ephemeral=True)
         except Exception as e:
-            console.print(_format_error("Settings Command", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Settings Command", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(name="logs", description="Show recent giveaway activity logs")
@@ -2203,7 +2327,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
             ]
             await interaction.followup.send("\n".join(lines), ephemeral=True)
         except Exception as e:
-            console.print(_format_error("Logs Command", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Logs Command", str(e)))
             await interaction.followup.send("Something went wrong. Please try again.", ephemeral=True)
 
     @app_commands.command(
@@ -2229,7 +2353,7 @@ class GiveawayCog(commands.GroupCog, group_name="giveaway", group_description="M
                 ephemeral=True,
             )
         except Exception as e:
-            console.print(_format_error("Clear All Data", str(e)))
+            logging.getLogger("nuvella.giveaway").error("%s", _format_error("Clear All Data", str(e)))
             await interaction.followup.send("Failed to clear data. Check logs.", ephemeral=True)
 
 
