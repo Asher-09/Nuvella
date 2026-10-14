@@ -150,7 +150,7 @@
   "warn_ban_threshold": 7,
   "antinuke": {
     "enabled": true,
-    "message_spam_limit": 3,
+    "message_spam_limit": 5,
     "mention_limit": 5,
     "same_user_ping_limit": 8,
     "emoji_limit": 10,
